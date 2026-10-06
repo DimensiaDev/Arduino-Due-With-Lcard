@@ -117,6 +117,15 @@ DEFAULT_BANDPASS_LOW_HZ = 0.5
 DEFAULT_BANDPASS_HIGH_HZ = 40.0
 DEFAULT_BANDPASS_ORDER = 4
 
+# Минимальное число отсчётов, при котором оценка амплитуды имеет
+# смысл. Ниже МНК на 3 неизвестных (DC + cos + sin) вырождается.
+MIN_EPOCH_SAMPLES = 20
+
+# Минимальный множитель RMS относительно медианы канала, при
+# котором (эпоха, канал) считается аномалией. Не даёт порогу
+# «схлопнуться» на каналах с малым разбросом RMS.
+MIN_RMS_RATIO = 3.0
+
 # Порог затухания в фильтрованных каналах, выше которого
 #stimulated frequency приходится брать из raw_*.
 #
@@ -157,35 +166,10 @@ def unescape_pandas_quoted(value: str) -> str:
     return value
 
 
-def load_metadata_and_data(
-    file_path: Path,
-) -> tuple[dict, pd.DataFrame]:
+def parse_metadata(meta_part: str) -> dict:
     """
-    Читает файл формата:
-
-        metadata...
-        # DATA
-        column1    column2    ...
-        value      value      ...
-
-    Metadata и данные обрабатываются отдельно.
+    Разбирает секцию `# METADATA`.
     """
-
-    content = file_path.read_text(
-        encoding="utf-8",
-    )
-
-    if "# DATA" not in content:
-        raise ValueError(f"В файле {file_path} отсутствует секция '# DATA'")
-
-    meta_part, data_part = content.split(
-        "# DATA",
-        1,
-    )
-
-    # ------------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------------
 
     metadata = {}
 
@@ -206,20 +190,89 @@ def load_metadata_and_data(
 
         metadata[key] = value
 
-    # ------------------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------------------
+    return metadata
 
-    if not data_part.strip():
+
+def load_metadata(
+    file_path: Path,
+) -> dict:
+    """
+    Читает ТОЛЬКО metadata файла.
+
+    Дешёвый проход: план групп и выбор источника строятся по
+    metadata, а разбирать таблицу `# DATA` (это 3-12 с на 210
+    файлов) для этого не нужно.
+    """
+
+    content = file_path.read_text(encoding="utf-8")
+
+    if "# DATA" not in content:
+        raise ValueError(
+            f"В файле {file_path} отсутствует секция '# DATA'"
+        )
+
+    meta_part, _ = content.split("# DATA", 1)
+
+    return parse_metadata(meta_part)
+
+
+def parse_data_table(
+    data_part: str,
+    file_path: Path,
+) -> pd.DataFrame:
+    """
+    Разбирает таблицу `# DATA`.
+
+    Сначала C-движок (15.7 мс/файл), при ошибке — python-движок
+    (59.2 мс/файл), который терпимее к кривым строкам.
+    """
+
+    payload = data_part.strip()
+
+    if not payload:
         raise ValueError(f"После '# DATA' нет данных: {file_path}")
 
-    df = pd.read_csv(
-        io.StringIO(data_part.strip()),
-        sep="\t",
-        engine="python",
-    )
+    try:
+        return pd.read_csv(
+            io.StringIO(payload),
+            sep="\t",
+        )
+    except pd.errors.ParserError:
+        return pd.read_csv(
+            io.StringIO(payload),
+            sep="\t",
+            engine="python",
+            on_bad_lines="warn",
+        )
 
-    return metadata, df
+
+def load_metadata_and_data(
+    file_path: Path,
+) -> tuple[dict, pd.DataFrame]:
+    """
+    Читает файл формата:
+
+        metadata...
+        # DATA
+        column1    column2    ...
+        value      value      ...
+
+    Metadata и данные обрабатываются отдельно.
+    """
+
+    content = file_path.read_text(encoding="utf-8")
+
+    if "# DATA" not in content:
+        raise ValueError(
+            f"В файле {file_path} отсутствует секция '# DATA'"
+        )
+
+    meta_part, data_part = content.split("# DATA", 1)
+
+    return (
+        parse_metadata(meta_part),
+        parse_data_table(data_part, file_path),
+    )
 
 
 # ============================================================================
@@ -278,7 +331,7 @@ def get_optional_float(
 
 def resolve_sampling_rate(
     metadata: dict,
-    df: pd.DataFrame,
+    df: pd.DataFrame | None = None,
 ) -> float:
     """
     Определяет номинальную частоту дискретизации.
@@ -286,10 +339,12 @@ def resolve_sampling_rate(
     ВАЖНО:
         В секции `# METADATA` ключа `lsl_nominal_srate_hz` НЕТ.
         Он есть только:
-            * в таблице `# DATA` (столбец `lsl_nominal_srate_hz`);
-            * внутри `lsl_stream_meta_json` -> `nominal_srate_hz`.
+            * внутри `lsl_stream_meta_json` -> `nominal_srate_hz`;
+            * в таблице `# DATA` (столбец `lsl_nominal_srate_hz`).
 
-    Источники проверяются в этом порядке.
+    Источники проверяются в этом порядке. `df` может быть None —
+    тогда третий источник недоступен, но первые два покрывают
+    все реальные файлы.
     """
 
     # 1. Прямой ключ в metadata (на случай будущего формата).
@@ -319,7 +374,7 @@ def resolve_sampling_rate(
                 return candidate
 
     # 3. Столбец таблицы данных.
-    if "lsl_nominal_srate_hz" in df.columns:
+    if df is not None and "lsl_nominal_srate_hz" in df.columns:
         values = pd.to_numeric(
             df["lsl_nominal_srate_hz"],
             errors="coerce",
@@ -562,7 +617,8 @@ def collect_files(
     folder_paths: list[str],
 ) -> list[Path]:
     """
-    Находит step-файлы во всех переданных директориях.
+    Находит step-файлы во всех переданных директориях, включая
+    вложенные.
 
     Пример:
 
@@ -580,8 +636,13 @@ def collect_files(
         if not folder.is_dir():
             raise NotADirectoryError(f"Не является директорией: {folder}")
 
-        for file_path in folder.iterdir():
-            if file_path.is_file() and STEP_FILE_PATTERN.match(file_path.name):
+        # Рекурсивно: структура `experiments/<испытуемый>/*.txt`
+        # очень распространена, и молчаливый ноль найденных файлов
+        # при указании на `experiments` сбивал с толку.
+        for file_path in folder.rglob("*"):
+            if file_path.is_file() and STEP_FILE_PATTERN.match(
+                file_path.name
+            ):
                 files.add(file_path)
 
     return sorted(files)
@@ -612,37 +673,19 @@ def select_source(
     source: str,
 ) -> list[str]:
     """
-    Выбирает набор каналов-«источников».
+    Возвращает каналы выбранного источника данных.
 
-    `auto`:
-        `filtered_*`, если все стимулируемые частоты проходят
-        внутри полосы фильтра; иначе `raw_*`.
-
-    Почему:
-        в файлах стоит `sosfiltfilt` с полосой 0.5–40 Гц.
-        Частота 55 Гц (шаг 7) и 32–34 Гц (шаг 6) в `filtered_*`
-        отсутствуют: подавление >70 дБ, вплоть до нуля.
-
-    Фактический выбор делает `choose_source_for_group` — здесь
-    проверяется только наличие колонок.
+    Выбор между `filtered_*` и `raw_*` делает `plan_sources`
+    (по частотам стимуляции), здесь — только проверка наличия
+    колонок. `auto` сюда не доходит.
     """
 
-    if source == "raw":
-        columns = find_signal_columns(df, "raw_")
-        label = "raw_"
-    elif source == "filtered":
-        columns = find_signal_columns(df, "filtered_")
-        label = "filtered_"
-    else:
-        columns = find_signal_columns(df, "filtered_")
-        label = "filtered_"
+    prefix = f"{source}_"
 
-        if not columns:
-            columns = find_signal_columns(df, "raw_")
-            label = "raw_"
+    columns = find_signal_columns(df, prefix)
 
     if not columns:
-        raise ValueError(f"В файле нет каналов {label}*")
+        raise ValueError(f"В файле нет каналов {prefix}*")
 
     return columns
 
@@ -994,8 +1037,8 @@ def validate_epoch_quality(
     2) КАНАЛ внутри эпохи помечается как NaN, если RMS грубо
        выходит за пределы, характерные для этого канала
        (проверка в логарифмическом масштабе, см.
-       `robust_mask_log`). Так отсеиваются битые электроды,
-       перегрузки усилителя и движения.
+       `robust_mask_log`). Так отсеиваются битые электроды и
+       перегрузки усилителя.
 
       В этих данных: у испытуемого Чаркин `filtered_ch_1`
       имеет std = 488 ед. и |x|max = 5096, тогда как у соседних
@@ -1007,10 +1050,12 @@ def validate_epoch_quality(
     отсеивает именно неисправность канала, а не сильную
     фотостимуляцию или вспышку альфа-ритма.
 
-    Порог 3.0 по log10(RMS) отсекает 131 пару (эпоха, канал) из
-    1672, из них 90 приходятся на заведомый мусор (RMS > 100
-    при типичном уровне 14 ед.). Остальные 231 пара с RMS 30–100
-    не отсекаются: это движение и открытые глаза, а не поломка.
+    Порог строгий намеренно. База (медиана и MAD) считается
+    отдельно для каждого шага: разные шаги имеют разные частоты
+    и разный фоновый уровень. Типичный порог по MAD получается
+    10-180x медианы, так что движение и открытые глаза
+    (RMS 30-100 при типичном 25-43) остаются нетронутыми, а
+    отсекаются только поломки (RMS 300-7000).
     """
 
     kept = []
@@ -1073,55 +1118,71 @@ def validate_epoch_quality(
     # ------------------------------------------------------------------
     # Битые каналы внутри эпох
     # ------------------------------------------------------------------
+    #
+    # База (медиана и MAD) считается ОТДЕЛЬНО для каждого шага:
+    # разные шаги имеют разные частоты стимуляции и разный
+    # фоновый уровень, и общий MAD смешивал бы их. Проверено:
+    # при объединении шагов 6 и 7 порог по DAC0 уходил на 50
+    # отбрасываний вместо 24 + 26 по отдельности.
 
     n_channels = kept[0]["data"].shape[1]
 
-    rms = np.full(
-        (len(kept), n_channels),
-        np.nan,
-        dtype=float,
-    )
+    if rms_threshold <= 0:
+        return kept
+
+    by_step = defaultdict(list)
 
     for row, epoch in enumerate(kept):
-        for channel in range(n_channels):
-            column = epoch["data"][:, channel]
-
-            finite = column[np.isfinite(column)]
-
-            if finite.size:
-                rms[row, channel] = float(np.sqrt(np.mean(finite ** 2)))
+        by_step[epoch["step"]["step_index"]].append(row)
 
     masked = []
 
-    for channel in range(n_channels):
-        column = rms[:, channel]
+    for step_index, rows in sorted(by_step.items()):
+        rows = sorted(rows)
 
-        if rms_threshold <= 0:
-            continue
+        block = np.full(
+            (len(rows), n_channels),
+            np.nan,
+            dtype=float,
+        )
 
-        mask = robust_mask_log(column, rms_threshold)
+        for position, row in enumerate(rows):
+            for channel in range(n_channels):
+                column = kept[row]["data"][:, channel]
 
-        bad = np.flatnonzero(np.isfinite(column) & ~mask)
+                finite = column[np.isfinite(column)]
 
-        if bad.size == 0:
-            continue
+                if finite.size:
+                    block[position, channel] = float(
+                        np.sqrt(np.mean(finite ** 2))
+                    )
 
-        reference = float(np.nanmedian(column))
+        for channel in range(n_channels):
+            column = block[:, channel]
 
-        for row in bad:
-            subject = kept[row]["file"].parent.name
+            mask = robust_mask_log(column, rms_threshold)
 
-            name = kept[row]["file"].name
+            bad = np.flatnonzero(np.isfinite(column) & ~mask)
 
-            value = rms[row, channel]
+            if bad.size == 0:
+                continue
 
-            masked.append(
-                f"  канал {channel + 1}: RMS {value:.4g} "
-                f"({value / reference:.0f}x от {reference:.4g}) — "
-                f"{subject}/{name}"
-            )
+            reference = float(np.nanmedian(column))
 
-            kept[row]["data"][:, channel] = np.nan
+            for position in bad:
+                row = rows[position]
+
+                value = block[position, channel]
+
+                masked.append(
+                    f"  шаг {step_index}, канал {channel + 1}: "
+                    f"RMS {value:.4g} ({value / reference:.0f}x от "
+                    f"{reference:.4g}) — "
+                    f"{kept[row]['file'].parent.name}/"
+                    f"{kept[row]['file'].name}"
+                )
+
+                kept[row]["data"][:, channel] = np.nan
 
     if masked:
         print()
@@ -1132,8 +1193,10 @@ def validate_epoch_quality(
         )
 
         print(
-            f"  (порог log10(RMS) <= median + {rms_threshold:g}*MAD; "
-            "типичный RMS 10-20 ед., отсекается мусор от ~100 ед.)",
+            f"  (порог: RMS > median * max({MIN_RMS_RATIO:g}, "
+            f"10^({rms_threshold:g}*MAD) от log10 RMS), база по шагам; "
+            "ловит битые электроды и перегрузку, не трогая движение "
+            "и альфа)",
             file=sys.stderr,
         )
 
@@ -1192,8 +1255,8 @@ def source_for_group(
         `MAX_ATTENUATION_DB`. Иначе — `raw_*`.
 
     Проверяется не только верхняя граница полосы: 32–34 Гц
-    формально попадают в 0.5–40 Гц, но для фильтра Баттерворта
-    4 порядка это -146 дБ, то есть компоненты там нет.
+    формально попадают в 0.5–40 Гц, но спад Баттерворта 4 порядка,
+    применённый дважды, даёт на 34 Гц -2.3 дБ, а на 55 Гц -23.6 дБ.
     """
 
     if source != "auto":
@@ -1207,6 +1270,26 @@ def source_for_group(
             return "raw"
 
     return "filtered"
+
+
+def attenuated_frequencies(
+    signature: tuple,
+    bandpass: dict,
+    fs: float,
+) -> list:
+    """
+    Стимулируемые частоты, которые `filtered_*` гасит
+    сильнее `MAX_ATTENUATION_DB`.
+    """
+
+    return [
+        frequency
+        for frequency in signature
+        if (
+            bandpass_attenuation_db(frequency, bandpass, fs)
+            > MAX_ATTENUATION_DB
+        )
+    ]
 
 
 def format_attenuations(
@@ -1248,6 +1331,79 @@ def source_suffix(name: str) -> str:
 # ============================================================================
 
 
+def epoch_time_offset(
+    epoch: dict,
+    compensate_latency: bool,
+) -> float:
+    """
+    Сдвиг оси времени эпохи относительно момента переключения
+    частот на Arduino.
+
+    Отсчёты приходят с шагом ровно 1/fs, поэтому ось эпохи — это
+    равномерная сетка `n/fs`, сдвинутая на `latency`:
+
+        t_n = n / fs + offset
+
+    где `offset = latency` при компенсации и 0 без неё.
+    """
+
+    if compensate_latency:
+        return float(epoch["latency"])
+
+    return 0.0
+
+
+def epoch_time_bounds(
+    epoch: dict,
+    guard: float,
+    compensate_latency: bool,
+) -> tuple[float, float, float]:
+    """
+    Границы участка эпохи, пригодного для анализа.
+
+    Возвращает:
+
+        offset : сдвиг сетки `n/fs`
+        lower  : нижняя граница времени
+        upper  : верхняя граница времени
+
+    Что исключается:
+
+      * начало файла содержит данные, записанные ещё на частотах
+        ПРЕДЫДУЩЕГО шага (шаг помечается на PC в момент приёма
+        пачки, а не в момент acquisition);
+      * `sosfiltfilt` / `filtfilt` дают переходные процессы
+        длиной padlen (~27 отсчётов, ~54 мс) на обоих краях
+        каждого файла, а вызванная реакция максимальна в начале;
+      * всё, что позже конца шага `export_step_duration_s`.
+
+    Компенсация задержки сдвигает ось так, чтобы `t = 0`
+    соответствовало моменту переключения частот. Событие
+    `stim_events_json` фиксируется сразу после подтверждения
+    команды, т.е. с точностью до времени обмена по UART (~1-2 мс),
+    что на порядок лучше разброса 17-53 мс между шагами.
+    """
+
+    offset = epoch_time_offset(epoch, compensate_latency)
+
+    fs = epoch["fs"]
+
+    n_samples = epoch["data"].shape[0]
+
+    last = (n_samples - 1) / fs + offset
+
+    duration = epoch["step"].get("duration") or 0.0
+
+    if duration > 0:
+        last = duration if duration < last else last
+
+    return (
+        offset,
+        float(offset + guard),
+        float(last - guard),
+    )
+
+
 def trim_epoch(
     epoch: dict,
     guard: float,
@@ -1255,54 +1411,52 @@ def trim_epoch(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Отбрасывает «грязные» края эпохи и строит ось времени.
-
-    Что удаляется:
-
-      * начало файла содержит данные, записанные ещё на частотах
-        ПРЕДЫДУЩЕГО шага (шаг помечается на PC в момент приёма
-        пачки, а не в момент acquisition);
-      * `sosfiltfilt` / `filtfilt` дают переходные процессы
-        длиной padlen (~27 отсчётов, ~54 мс) на обоих краях
-        каждого файла — а вызванная реакция максимальна в начале;
-      * хвост выходит за пределы длительности шага.
-
-    Компенсация задержки сдвигает ось времени так, чтобы `t = 0`
-    соответствовало моменту переключения частот на Arduino
-    (событие `stim_events_json` фиксируется сразу после подтверждения
-    команды, т.е. с точностью до времени обмена по UART).
     """
 
-    time = epoch["time"]
+    time = epoch["time"] + epoch_time_offset(epoch, compensate_latency)
+
     data = epoch["data"]
 
-    if compensate_latency:
-        time = time + epoch["latency"]
-
-    duration = epoch["step"].get("duration") or 0.0
-
-    if duration > 0:
-        # Отсчёты физически не могли относиться к этому шагу.
-        end = float(time[-1])
-
-        upper = duration if duration < end else end
-    else:
-        upper = float(time[-1])
+    _, lower, upper = epoch_time_bounds(
+        epoch,
+        guard,
+        compensate_latency,
+    )
 
     keep = (
-        (time >= guard)
-        & (time <= upper - guard)
+        (time >= lower)
+        & (time <= upper)
         & np.isfinite(time)
     )
 
-    if keep.sum() < 8:
-        # Защита: эпоха слишком короткая для запрошенного guard.
-        keep = (
-            (time >= guard / 2.0)
-            & (time <= float(time[-1]) - guard / 2.0)
+    if keep.sum() < MIN_EPOCH_SAMPLES:
+        # Запрошенный guard не помещается в эпоху.
+        half = guard / 2.0
+
+        print(
+            f"ВНИМАНИЕ: guard={guard:g} с почти равен длине шага "
+            f"({epoch['file'].name}); guard уменьшен до {half:g} с",
+            file=sys.stderr,
         )
 
-    if keep.sum() < 8:
-        keep = np.isfinite(time)
+        keep = (
+            (time >= lower - half)
+            & (time <= upper + half)
+            & np.isfinite(time)
+        )
+
+    if keep.sum() < MIN_EPOCH_SAMPLES:
+        print(
+            f"ВНИМАНИЕ: после отсечения в {epoch['file'].name} "
+            "осталось меньше "
+            f"{MIN_EPOCH_SAMPLES} отсчётов; отбрасываем эпоху",
+            file=sys.stderr,
+        )
+
+        return (
+            np.empty(0),
+            np.empty((0, data.shape[1])),
+        )
 
     return (
         time[keep],
@@ -1543,6 +1697,9 @@ def inter_trial_coherence(
     Именно для этого и нужен ITC, а не `|sum C| / sum |C|`:
     последний вариант взвешен по амплитуде и «выглядит
     когерентным» из-за одной сильной пробы.
+
+    Пробы с ровно нулевой амплитудой ИСКЛЮЧАЮТСЯ, а не считаются
+    за фазовые 0: у нулевой величины фазы нет.
     """
 
     coefficients = np.asarray(coefficients, dtype=complex)
@@ -1561,11 +1718,13 @@ def inter_trial_coherence(
     if not nonzero.any():
         return float("nan")
 
-    unit = np.zeros(coefficients.size, dtype=complex)
-
-    unit[nonzero] = coefficients[nonzero] / magnitudes[nonzero]
-
-    return float(np.abs(np.mean(unit)))
+    return float(
+        np.abs(
+            np.mean(
+                coefficients[nonzero] / magnitudes[nonzero]
+            )
+        )
+    )
 
 
 def amplitude_weighted_coherence(
@@ -1595,6 +1754,56 @@ def amplitude_weighted_coherence(
     return float(np.abs(np.sum(coefficients)) / denominator)
 
 
+def _nan_median_or_nan(values: np.ndarray) -> float:
+    """
+    Медиана без предупреждения о пустом срезе.
+    """
+
+    values = np.asarray(values, dtype=float)
+
+    values = values[np.isfinite(values)]
+
+    if values.size == 0:
+        return float("nan")
+
+    return float(np.median(values))
+
+
+def mad_scale(
+    deviations: np.ndarray,
+) -> float:
+    """
+    Масштаб устойчивой оценки разброса.
+
+        MAD-sigma = 1.4826 * median(|v - median(v)|)
+
+    Если MAD равен нулю (больше половины значений совпадают),
+    используется МИНИМАЛЬНЫЙ ненулевой разброс, а НЕ максимальный:
+    иначе единственный выброс сам себе задаёт порог и всегда
+    проходит проверку.
+    """
+
+    if deviations.size == 0:
+        return np.finfo(float).eps
+
+    median = float(np.median(deviations))
+
+    scale = 1.4826 * median
+
+    if scale > 0:
+        return scale
+
+    nonzero = deviations[deviations > 0]
+
+    if nonzero.size:
+        return max(
+            float(np.min(nonzero)),
+            np.finfo(float).eps,
+        )
+
+    return np.finfo(float).eps
+
+
 def robust_mask(
     values: np.ndarray,
     threshold: float,
@@ -1602,37 +1811,22 @@ def robust_mask(
     """
     Маска выбросов по медиане и MAD.
 
-        median_abs_deviation = 1.4826 * median(|v - median(v)|)
-
     MAD используется вместо стандартного отклонения, потому что
     сам выброс раздувает sigma и маскирует себя.
-
-    Если MAD равен нулю (больше половины значений совпадают),
-    сравнение идёт по вводу отклонения от медианы.
 
     `threshold` = 0 отключает проверку.
     """
 
     finite = np.isfinite(values)
 
-    if not finite.any():
+    if not finite.any() or threshold <= 0:
         return finite
 
     clean = values[finite]
 
     median = float(np.median(clean))
 
-    deviation = float(
-        np.median(np.abs(clean - median))
-    )
-
-    scale = 1.4826 * deviation
-
-    if scale <= 0:
-        scale = max(
-            float(np.max(np.abs(clean - median))),
-            np.finfo(float).eps,
-        )
+    scale = mad_scale(np.abs(clean - median))
 
     return finite & (np.abs(values - median) <= threshold * scale)
 
@@ -1640,47 +1834,67 @@ def robust_mask(
 def robust_mask_log(
     values: np.ndarray,
     threshold: float,
+    min_ratio: float = 3.0,
 ) -> np.ndarray:
     """
-    Маска выбросов по МАСШТАБИРОВАННОЙ медиане и MAD.
+    Маска выбросов по медиане и MAD в логарифмическом масштабе.
 
-    RMS канала распределён сильно правоскошено: типичное значение
+    RMS распределён сильно правоскошено: типичное значение
     10–20 ед., а у артефактов 100–7000 ед. На линейной шкале MAD
-    растягивается выбросами и порог получается слишком мягким
-    (или, наоборот, для канала с двумя модами — слишком жёстким,
-    как у `filtered_ch_1`: медиана 3.3, MAD 2.8).
+    растягивается выбросами.
 
-    Поэтому отбрасывание считается в логарифмическом масштабе,
-    где распределение становится приблизительно симметричным.
+    В логарифмическом масштабе распределение становится
+    приблизительно симметричным, но ТОЛЬКО при условии, что порог
+    не «схлопывается» на каналах с малым разбросом:
 
-    `threshold` задаётся в единицах MAD от log10(RMS):
-        3.0 -> примерно отсечение мощности в 10 раз выше типичной.
+        эффективный множитель = 10 ** (threshold * MAD_log10)
 
-    `threshold` = 0 отключает проверку.
+    У `filtered_ch_8` MAD_log10 = 0.088, поэтому при threshold = 3
+    множитель равен всего 1.83, и обычная 1.5-кратная вариация
+    RMS удалялась бы как «аномалия».
+
+    Поэтому итоговый порог — МАКСИМУМ из двух ОТНОСИТЕЛЬНЫХ оценок:
+
+        factor = max(min_ratio, 10 ** (threshold * MAD_log10))
+
+    и отбрасывается проба, только если RMS превышает
+    `median * factor`, т.е. она заведомо велика по обоим критериям
+    сразу. Пересечение критериев (AND на отбрасывание) давало бы
+    54 отбрасывания из 224 на шаге 1 вместо 13 и вырезало бы пробы
+    с сильным альфа-ритмом — то есть удаляло бы именно исследуемый
+    сигнал.
+
+    Типичный порог по MAD получается 10-180x медианы, что оставляет
+    нетронутыми движения и открытые глаза (RMS 30-100 при типичном
+    25-43) и отсекает только поломки (RMS 300-7000).
     """
 
     finite = np.isfinite(values) & (values > 0)
 
-    if not finite.any():
+    if not finite.any() or threshold <= 0:
         return finite
 
-    log_values = np.log10(values)
+    log_values = np.full(values.shape, np.nan, dtype=float)
+
+    log_values[finite] = np.log10(values[finite])
 
     clean = log_values[finite]
 
     median = float(np.median(clean))
 
-    deviation = 1.4826 * float(
-        np.median(np.abs(clean - median))
+    deviation = mad_scale(np.abs(clean - median))
+
+    linear_median = float(np.median(values[finite]))
+
+    # Оба порога — ОТНОСИТЕЛЬНЫЕ к медиане, иначе на канале с
+    # малым разбросом min_ratio сравнивался бы с абсолютной
+    # величиной и не срабатывал бы.
+    factor = max(
+        float(min_ratio),
+        10.0 ** (threshold * deviation),
     )
 
-    if deviation <= 0:
-        deviation = max(
-            float(np.max(np.abs(clean - median))),
-            1e-9,
-        )
-
-    return finite & (log_values <= median + threshold * deviation)
+    return finite & (values <= linear_median * factor)
 
 
 def robust_coherent_average(
@@ -1782,6 +1996,27 @@ def analyze_group(
 
     n_channels = len(channel_names)
 
+    # ------------------------------------------------------------------
+    # Отсечение выполняется ОДИН раз на эпоху и переиспользуется
+    # для всех четырёх частот: входные данные у них одинаковы.
+    # ------------------------------------------------------------------
+
+    prepared = []
+
+    for epoch in epochs:
+        time, data = trim_epoch(
+            epoch,
+            guard,
+            compensate_latency,
+        )
+
+        if len(time) < MIN_EPOCH_SAMPLES:
+            prepared.append((np.empty(0), data[:0, :]))
+
+            continue
+
+        prepared.append((time, data))
+
     # (n_epochs, n_channels) для каждой частоты
     coefficients = {}
 
@@ -1794,12 +2029,9 @@ def analyze_group(
             dtype=complex,
         )
 
-        for epoch_index, epoch in enumerate(epochs):
-            time, data = trim_epoch(
-                epoch,
-                guard,
-                compensate_latency,
-            )
+        for epoch_index, (time, data) in enumerate(prepared):
+            if len(time) == 0:
+                continue
 
             table[epoch_index, :] = complex_amplitudes(
                 time,
@@ -1808,87 +2040,92 @@ def analyze_group(
                 window_function,
             )
 
-        coherent = np.array(
-            [
-                coherent_average(table[:, channel_index])
-                for channel_index in range(n_channels)
-            ]
+        finite = (
+            np.isfinite(table.real)
+            & np.isfinite(table.imag)
         )
 
         # --------------------------------------------------------------
-        # Отбрасывание амплитудных выбросов (MAD)
+        # Маска принятых проб
         # --------------------------------------------------------------
         #
-        # Сделано ПОКАНАЛЬНО: один битый канал у одного
-        # испытуемого не должен выбрасывать его эпоху целиком
-        # из анализа по остальным каналам.
+        # ПокАНАЛЬНО: один битый канал у одного испытуемого
+        # не должен выбрасывать его эпоху целиком из анализа
+        # по остальным каналам.
+        #
+        # Уже включает пробы, помеченные NaN в
+        # `validate_epoch_quality` (битые электроды).
 
-        accepted = np.ones(
-            (n_epochs, n_channels),
-            dtype=bool,
-        )
+        accepted = finite.copy()
 
         if outlier_threshold > 0:
             for channel_index in range(n_channels):
                 amplitudes = np.abs(table[:, channel_index])
 
-                accepted[:, channel_index] = robust_mask(
+                accepted[:, channel_index] &= robust_mask(
                     amplitudes,
                     outlier_threshold,
                 )
 
-        robust_values = np.array(
+        n_accepted = np.sum(accepted, axis=0)
+
+        mean_values = np.array(
             [
-                robust_coherent_average(
-                    table[accepted[:, channel_index], channel_index]
-                )
-                for channel_index in range(n_channels)
+                coherent_average(table[accepted[:, column], column])
+                for column in range(n_channels)
             ]
         )
 
-        n_accepted = np.sum(accepted, axis=0)
+        robust_values = np.array(
+            [
+                robust_coherent_average(
+                    table[accepted[:, column], column]
+                )
+                for column in range(n_channels)
+            ]
+        )
 
         coefficients[name] = {
             "frequency": frequency,
             "table": table,
             "accepted": accepted,
             "n_accepted": n_accepted,
-            "coherent": coherent,
+            "coherent": mean_values,
             "robust": robust_values,
-            "robust_amplitude": np.abs(robust_values),
-            "robust_phase": np.angle(robust_values, deg=True),
             "amplitude": np.abs(robust_values),
             "phase": np.angle(robust_values, deg=True),
-            "mean_amplitude": np.abs(coherent),
-            "mean_phase": np.angle(coherent, deg=True),
+            "mean_amplitude": np.abs(mean_values),
+            "mean_phase": np.angle(mean_values, deg=True),
+            # Медиана |C_i| по принятым пробам: типичная (не
+            # когерентная) амплитуда одиночной пробы на этой частоте.
             "median_amplitude": np.array(
                 [
-                    np.nanmedian(np.abs(table[:, channel_index]))
-                    for channel_index in range(n_channels)
+                    _nan_median_or_nan(
+                        np.abs(table[accepted[:, column], column])
+                    )
+                    for column in range(n_channels)
                 ]
             ),
             "itc": np.array(
                 [
                     inter_trial_coherence(
-                        table[accepted[:, channel_index], channel_index]
+                        table[accepted[:, column], column]
                     )
-                    for channel_index in range(n_channels)
+                    for column in range(n_channels)
                 ]
             ),
             "awc": np.array(
                 [
                     amplitude_weighted_coherence(
-                        table[accepted[:, channel_index], channel_index]
+                        table[accepted[:, column], column]
                     )
-                    for channel_index in range(n_channels)
+                    for column in range(n_channels)
                 ]
             ),
             "snr": np.array(
                 [
-                    coherent_snr(
-                        table[accepted[:, channel_index], channel_index]
-                    )
-                    for channel_index in range(n_channels)
+                    coherent_snr(table[accepted[:, column], column])
+                    for column in range(n_channels)
                 ]
             ),
         }
@@ -1922,82 +2159,230 @@ def analyze_group(
 
 
 def build_time_grid(
-    window: float,
+    t_start: float,
+    t_stop: float,
     fs: float,
 ) -> np.ndarray:
     """
-    Равномерная сетка с шагом ровно `1/fs`.
+    Равномерная сетка времени с шагом РОВНО `1/fs`.
 
-    Шаг `1/fs` важен: при `np.linspace(-W/2, W/2, ceil(W*fs)+1)`
-    шаг сетки отличается от `1/fs` (до ~0.8%), что при 55 Гц
-    даёт ошибку фазы в несколько градусов.
+    Время отсчитывается от момента переключения частот на Arduino
+    (событие `stim_events_json`).
+
+    Шаг `1/fs` важен: при `np.linspace(a, b, ceil(W*fs)+1)` шаг
+    отличается от `1/fs` (до ~0.8%), что на 55 Гц даёт ошибку
+    фазы в несколько градусов.
     """
 
-    n_points = int(round(window * fs)) + 1
+    if t_stop <= t_start:
+        raise ValueError(
+            f"Пустой интервал анализа: [{t_start:g}, {t_stop:g}] с."
+        )
+
+    # FLOOR, а не round: при round последняя точка сетки могла
+    # выйти за t_stop на выборку (t = 2.8509 при t_stop = 2.8500),
+    # и на ней count_valid = 0, average = NaN.
+    n_points = int(np.floor((t_stop - t_start) * fs)) + 1
 
     if n_points < 3:
-        raise ValueError("Окно слишком короткое для частоты дискретизации.")
+        raise ValueError(
+            f"Интервал {t_stop - t_start:g} с слишком короткий "
+            f"для частоты дискретизации {fs:g} Гц."
+        )
 
-    return (np.arange(n_points) - n_points // 2) / fs
+    return t_start + np.arange(n_points) / fs
+
+
+def resample_epoch(
+    epoch: dict,
+    time_grid: np.ndarray,
+    guard: float,
+    compensate_latency: bool,
+) -> np.ndarray:
+    """
+    Точное вынесение эпохи на абсолютную сетку времени.
+
+    ИНТЕРПОЛЯЦИИ НЕТ и она не нужна: ось эпохи `t = n/fs + offset`
+    уже равномерна с шагом 1/fs, поэтому отсчёту сетки
+    `time_grid[k]` соответствует ровно один индекс
+
+        n_k = round((time_grid[k] - offset) * fs)
+
+    Так каждая эпоха попадает на сетку по СВОЕМУ времени, а не по
+    индексу: разброс задержки между шагами (до 45 мс, т.е. до 23
+    отсчётов) компенсируется, иначе усреднение размывалось бы на
+    2.5 оборота при 55 Гц.
+
+    Вне `[offset + guard, last - guard]` и вне диапазона индексов
+    возвращается NaN — они не усредняются.
+    """
+
+    data = epoch["data"]
+
+    fs = epoch["fs"]
+
+    offset, lower, upper = epoch_time_bounds(
+        epoch,
+        guard,
+        compensate_latency,
+    )
+
+    indices = np.rint((time_grid - offset) * fs).astype(np.int64)
+
+    n_samples = data.shape[0]
+
+    valid = (
+        (indices >= 0)
+        & (indices < n_samples)
+        & (time_grid >= lower)
+        & (time_grid <= upper)
+    )
+
+    values = np.full(
+        (len(time_grid), data.shape[1]),
+        np.nan,
+        dtype=float,
+    )
+
+    if valid.any():
+        values[valid, :] = data[indices[valid], :]
+
+    return values
+
+
+def trimmed_time_average(
+    stacked: np.ndarray,
+    count_valid: np.ndarray,
+    fraction: float,
+) -> np.ndarray:
+    """
+    Усечённое среднее по оси эпох, покАНАЛЬНО.
+
+    Обычное среднее по 30 эпохам определяется двумя-тремя пробами
+    с артефактами: на шаге 3 график усреднения во времени
+    показывал красивую 12 Гц-волну на `filtered_ch_1`, в то время
+    как ITC на этой частоте и канале равнялся 0.17, то есть ниже
+    шумового уровня 0.183. Частотная часть считалась устойчиво
+    (медиана), а график — нет, и они противоречили друг другу.
+
+    Отбрасывается `fraction` самых больших и столько же самых
+    маленьких значений в каждой точке времени. Медиана не подходит:
+    усреднённый сигнал должен остаться непрерывным.
+
+    `stacked` имеет форму (n_epochs, n_time, n_channels); NaN
+    сортируются numpy в конец, поэтому срез по верхней границе
+    заведомо не содержит пропусков.
+
+    Число отбрасываемых проб берётся от МИНИМАЛЬНОГО числа
+    валидных проб по времени внутри канала: иначе в точках, где
+    часть эпох дала NaN, в срез попали бы пропуски.
+    """
+
+    total = stacked.shape[0]
+
+    keep = int(np.floor(total * fraction))
+
+    if total - 2 * keep < 3:
+        keep = max(0, (total - 3) // 2)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+
+        if keep <= 0:
+            return np.nanmean(stacked, axis=0)
+
+        ordered = np.sort(stacked, axis=0)
+
+        result = np.full(
+            (stacked.shape[1], stacked.shape[2]),
+            np.nan,
+            dtype=float,
+        )
+
+        # Минимальное число валидных проб по времени, на канал.
+        minimum = np.min(count_valid, axis=0)
+
+        for channel in range(stacked.shape[2]):
+            high = int(minimum[channel]) - keep
+
+            if high <= keep:
+                result[:, channel] = np.nanmean(
+                    stacked[:, :, channel],
+                    axis=0,
+                )
+
+                continue
+
+            result[:, channel] = np.mean(
+                ordered[keep:high, :, channel],
+                axis=0,
+            )
+
+    return result
 
 
 def average_group(
     epochs: list[dict],
     time_grid: np.ndarray,
-    n_channels: int,
     guard: float,
     compensate_latency: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    trim_fraction: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Усреднение во времени внутри группы.
 
-    Отсчёты уже лежат на равномерной сетке `t = n / fs`, поэтому
-    интерполяция НЕ НУЖНА: эпохи просто выравниваются по индексу
-    отсчёта и обрезаются до общей длины.
+    Эпохи выносятся на ОБЩУЮ абсолютную сетку времени, поэтому
+    усреднение идёт по одному и тому же моменту времени, а не по
+    одному и тому же индексу отсчёта: разброс задержки между
+    шагами (до 45 мс = 23 отсчёта) компенсируется, иначе волна
+    размывалась бы на 2.5 оборота при 55 Гц.
+
+    Усреднение — УСЕЧЁННОЕ (см. `trimmed_time_average`), чтобы
+    график и частотные числа не противоречили друг другу.
+
+    Возвращает `time_grid`, `average`, `sem`, `count_valid`.
+    Формы всех четырёх совпадают.
     """
 
-    blocks = []
-
-    for epoch in epochs:
-        time, data = trim_epoch(
+    blocks = [
+        resample_epoch(
             epoch,
+            time_grid,
             guard,
             compensate_latency,
         )
+        for epoch in epochs
+    ]
 
-        if len(time) == 0:
-            continue
+    usable = [
+        block
+        for block in blocks
+        if np.isfinite(block).any()
+    ]
 
-        blocks.append((time, data))
+    if not usable:
+        raise ValueError(
+            "После отсечения не осталось ни одного отсчёта. "
+            "Уменьшите --guard."
+        )
 
-    if not blocks:
-        raise ValueError("После отсечения не осталось ни одной эпохи.")
-
-    # Эпохи могут отличаться по длине на несколько отсчётов.
-    # Для усреднения во времени берём общую часть.
-    n_usable = min(len(time) for time, _ in blocks)
-
-    if n_usable < len(time_grid):
-        # Общий участок короче запрошенного окна: сокращаем окно.
-        time_grid = time_grid[:n_usable]
-
-    fs = blocks[0][0][1] - blocks[0][0][0]
-
-    stacked = np.stack(
-        [data[:len(time_grid), :] for _, data in blocks],
-        axis=0,
-    )
+    stacked = np.stack(usable, axis=0)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
 
-        average = np.nanmean(stacked, axis=0)
-        std = np.nanstd(stacked, axis=0, ddof=1)
+        count_valid = np.sum(
+            np.isfinite(stacked),
+            axis=0,
+        )
 
-    count_valid = np.sum(
-        np.isfinite(stacked),
-        axis=0,
-    )
+        average = trimmed_time_average(
+            stacked,
+            count_valid,
+            trim_fraction,
+        )
+
+        std = np.nanstd(stacked, axis=0, ddof=1)
 
     sem = np.divide(
         std,
@@ -2015,76 +2400,6 @@ def average_group(
 
 
 # ============================================================================
-# Latency scan
-# ============================================================================
-
-
-def latency_scan(
-    epochs: list[dict],
-    frequency: float,
-    channel_index: int,
-    guard: float,
-    compensate_latency: bool,
-    window_function: str,
-    span: float = 0.08,
-    step: float = 0.002,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Сканирует предполагаемый общий сдвиг времени `tau`.
-
-    Нужен, чтобы проверить, не размывает ли остаточная
-    несинхронность когерентное накопление: если максимум |C(tau)|
-    стоит при `tau != 0` и заметно выше |C(0)|, эпохи усредняются
-    с фазовым разбросом.
-
-    Сдвиг применяется ОДИНАКОВО ко всем эпохам, поэтому результат
-    показывает именно ОСТАТОЧНУЮ (усреднённую по испытуемым)
-    ошибку синхронизации, а не индивидуальную.
-
-    Индивидуальный разброс измеряется отдельно — см. задержку
-    «событие -> первый отсчёт», выводимую для каждой группы.
-    """
-
-    taus = np.arange(-span, span + step / 2, step)
-
-    accumulated = np.zeros(len(taus), dtype=complex)
-
-    used = 0
-
-    for epoch in epochs:
-        time, data = trim_epoch(
-            epoch,
-            guard,
-            compensate_latency,
-        )
-
-        signal = data[:, channel_index]
-
-        if len(signal) < 8:
-            continue
-
-        used += 1
-
-        for index, tau in enumerate(taus):
-            accumulated[index] += complex_amplitudes_core(
-                time + tau,
-                signal.reshape(-1, 1),
-                frequency,
-                window_function,
-            )[0]
-
-    if used:
-        # Усредняем, иначе величина растёт с числом эпох
-        # и несравнима с |C| из отчёта.
-        accumulated /= used
-
-    return (
-        taus,
-        np.abs(accumulated),
-    )
-
-
-# ============================================================================
 # Plotting
 # ============================================================================
 
@@ -2095,12 +2410,11 @@ def plot_group(
     sem: np.ndarray,
     channel_names: list[str],
     group: dict,
-    window: float,
     source: str,
     output: Path | None = None,
 ):
     """
-    График группы: усреднение во времени + амплитуда/фаза/ITC.
+    График группы: усреднение во времени + амплитуда + ITC.
     """
 
     fig, axes = plt.subplots(
@@ -2133,22 +2447,25 @@ def plot_group(
 
     ax.axvline(0, linestyle="--", linewidth=0.8, color="black")
 
-    ax.set_xlabel("Время относительно переключения стимула, с")
+    ax.set_xlabel(
+        "Время относительно переключения частот на Arduino, с"
+    )
     ax.set_ylabel("Амплитуда, ед. ADC")
     ax.set_title(
         f"{group['label']} — {group['n_epochs']} эпох, "
-        f"источник {source}, окно ±{window / 2:.3f} с"
+        f"источник {source}_*, "
+        f"t ∈ [{time_grid[0]:.3f}, {time_grid[-1]:.3f}] с"
     )
     ax.legend(fontsize=7, ncol=4)
     ax.grid(True, alpha=0.3)
 
     # ------------------------------------------------------------------
-    # Амплитуды
+    # Когерентная амплитуда
     # ------------------------------------------------------------------
 
     names = list(DAC_FREQUENCY_KEYS)
 
-    frequencies = [group["coefficients"][name]["frequency"] for name in names]
+    frequencies = [group["coefficients"][key]["frequency"] for key in names]
 
     labels = [
         f"{DAC_LABELS[name]}\n{frequencies[index]:g} Гц"
@@ -2159,20 +2476,25 @@ def plot_group(
 
     width = 0.8 / max(len(channel_names), 1)
 
+    centres = positions + width * (len(channel_names) - 1) / 2
+
     ax = axes[1]
 
     for index, name in enumerate(channel_names):
         ax.bar(
             positions + index * width,
-            [group["coefficients"][key]["amplitude"][index] for key in names],
+            [
+                group["coefficients"][key]["amplitude"][index]
+                for key in names
+            ],
             width=width,
             label=name,
         )
 
-    ax.set_xticks(positions + width * (len(channel_names) - 1) / 2)
+    ax.set_xticks(centres)
     ax.set_xticklabels(labels, fontsize=8)
     ax.set_ylabel("|C|, ед. ADC")
-    ax.set_title("Когерентная амплитуда")
+    ax.set_title("Когерентная амплитуда (медиана по пробам)")
     ax.legend(fontsize=7, ncol=4)
     ax.grid(True, alpha=0.3, axis="y")
 
@@ -2185,16 +2507,31 @@ def plot_group(
     for index, name in enumerate(channel_names):
         ax.bar(
             positions + index * width,
-            [group["coefficients"][key]["itc"][index] for key in names],
+            [
+                group["coefficients"][key]["itc"][index]
+                for key in names
+            ],
             width=width,
             label=name,
         )
 
-    ax.set_xticks(positions + width * (len(channel_names) - 1) / 2)
+    # Уровень шума при N эпохах: 1/sqrt(N).
+    noise_itc = 1.0 / np.sqrt(group["n_epochs"])
+
+    ax.axhline(
+        noise_itc,
+        linestyle=":",
+        linewidth=1.0,
+        color="black",
+        label=f"шум ({noise_itc:.3f})",
+    )
+
+    ax.set_xticks(centres)
     ax.set_xticklabels(labels, fontsize=8)
     ax.set_ylabel("ITC")
     ax.set_ylim(0, 1)
     ax.set_title("Inter-trial coherence (фазовая согласованность)")
+    ax.legend(fontsize=7, ncol=4)
     ax.grid(True, alpha=0.3, axis="y")
 
     fig.tight_layout()
@@ -2208,177 +2545,6 @@ def plot_group(
 # ============================================================================
 # Reporting
 # ============================================================================
-
-
-def print_group_report(
-    group: dict,
-    channel_names: list[str],
-    source: str,
-    outlier_threshold: float,
-):
-    """
-    Печатает результаты одной группы.
-
-    `|C|` — устойчивая оценка (медиана после отбрасывания
-    выбросов). `|C| mean` — обычное среднее: оно показывает,
-    насколько результат зависит от отдельных амплитудных аномалий.
-    """
-
-    print()
-    print("=" * 100)
-    print(
-        f"ГРУППА: {group['label']}   "
-        f"эпох: {group['n_epochs']}   "
-        f"шаги: {group['step_indices']}   "
-        f"источник: {source}"
-    )
-    print("=" * 100)
-
-    print(
-        f"Задержка «событие -> первый отсчёт»: "
-        f"{np.mean(group['latencies']) * 1e3:+.1f} мс "
-        f"(sd {np.std(group['latencies']) * 1e3:.1f}, "
-        f"разброс {(np.max(group['latencies']) - np.min(group['latencies'])) * 1e3:.1f})"
-    )
-
-    for key in DAC_FREQUENCY_KEYS:
-        result = group["coefficients"][key]
-
-        print()
-        print(f"{DAC_LABELS[key]} = {result['frequency']:.6f} Гц")
-
-        print(
-            f"{'Channel':<16}{'|C|':>11}{'Phase':>11}"
-            f"{'med|C|':>10}{'|C| mean':>11}"
-            f"{'ITC':>8}{'SNR':>8}{'n':>5}"
-        )
-        print("-" * 80)
-
-        for index, name in enumerate(channel_names):
-            print(
-                f"{name:<16}"
-                f"{result['amplitude'][index]:>11.4g}"
-                f"{result['phase'][index]:>10.2f}°"
-                f"{result['median_amplitude'][index]:>10.4g}"
-                f"{result['mean_amplitude'][index]:>11.4g}"
-                f"{result['itc'][index]:>8.3f}"
-                f"{result['snr'][index]:>8.2f}"
-                f"{result['n_accepted'][index]:>5d}"
-            )
-
-        # --------------------------------------------------------------
-        # Выбросы (только если --outlier-threshold задан)
-        # --------------------------------------------------------------
-
-        if outlier_threshold <= 0:
-            continue
-
-        for index, name in enumerate(channel_names):
-            rejected = ~result["accepted"][:, index]
-
-            if not rejected.any():
-                continue
-
-            amplitudes = np.abs(result["table"][:, index])
-
-            names = [
-                group["subjects"][row]
-                for row in np.flatnonzero(rejected)
-            ]
-
-            print()
-            print(
-                f"  Выбросы по {name} "
-                f"(отброшено {int(rejected.sum())} из "
-                f"{len(rejected)}, порог MAD x{outlier_threshold:g}): "
-                + ", ".join(names)
-            )
-
-            print(
-                f"    их |C|: "
-                + ", ".join(
-                    f"{value:.3g}"
-                    for value in amplitudes[rejected]
-                )
-                + f"; у остальных медиана "
-                f"{result['median_amplitude'][index]:.3g}, "
-                f"среднее {result['mean_amplitude'][index]:.3g}"
-            )
-
-    # ------------------------------------------------------------------
-    # Предупреждение о несогласованности
-    # ------------------------------------------------------------------
-
-    n_epochs = group["n_epochs"]
-
-    # Уровень ITC, ожидаемый от чистого шума при N эпохах.
-    noise_itc = 1.0 / np.sqrt(n_epochs)
-
-    weak = []
-
-    for key in DAC_FREQUENCY_KEYS:
-        result = group["coefficients"][key]
-
-        for index, name in enumerate(channel_names):
-            itc = result["itc"][index]
-
-            if not np.isfinite(itc) or itc > noise_itc * 1.5:
-                continue
-
-            weak.append(f"{name}@{DAC_LABELS[key]}")
-
-    if weak:
-        print()
-        print(
-            f"  ВНИМАНИЕ: ITC не превышает шумовой уровень "
-            f"({noise_itc:.3f} при {n_epochs} эпохах) для: "
-            + ", ".join(weak)
-        )
-        print(
-            "    Когерентного ответа на этих частотах в данных нет "
-            "либо он замаскирован шумом. Это не ошибка расчёта."
-        )
-
-
-def print_summary(
-    groups: dict,
-    channel_names: list[str],
-):
-    """
-    Сводная таблица по всем группам и каналам.
-    """
-
-    print()
-    print("=" * 100)
-    print("СВОДКА (среднее по всем группам)")
-    print("=" * 100)
-
-    print(
-        f"{'Channel':<16}"
-        + "".join(f"{DAC_LABELS[key]:>20}" for key in DAC_FREQUENCY_KEYS)
-    )
-    print("-" * 96)
-
-    for index, name in enumerate(channel_names):
-        row = f"{name:<16}"
-
-        for key in DAC_FREQUENCY_KEYS:
-            amplitudes = [
-                group["coefficients"][key]["amplitude"][index]
-                for group in groups.values()
-            ]
-
-            itc = [
-                group["coefficients"][key]["itc"][index]
-                for group in groups.values()
-            ]
-
-            row += (
-                f"{np.nanmean(amplitudes):>11.4g}"
-                f" ITC {np.nanmean(itc):>6.3f}"
-            )
-
-        print(row)
 
 
 def write_csv(
@@ -2442,6 +2608,258 @@ def write_csv(
                     )
 
     print(f"Таблица сохранена: {output}")
+
+
+def print_group_report(
+    group: dict,
+    channel_names: list[str],
+    source: str,
+    outlier_threshold: float,
+    bandpass: dict,
+    fs: float,
+):
+    """
+    Печатает результаты одной группы.
+
+    `|C|` — устойчивая оценка (медиана по принятым пробам).
+    `|C| mean` — обычное среднее: оно показывает, насколько
+    результат зависит от отдельных амплитудных аномалий.
+    `n` — число реально использованных проб на этом канале.
+    """
+
+    print()
+    print("=" * 100)
+    print(
+        f"ГРУППА: {group['label']}   "
+        f"эпох: {group['n_epochs']}   "
+        f"шаги: {group['step_indices']}   "
+        f"источник: {source}"
+    )
+    print("=" * 100)
+
+    latencies = group["latencies"]
+
+    print(
+        f"Задержка «событие -> первый отсчёт»: "
+        f"{np.mean(latencies) * 1e3:+.1f} мс "
+        f"(sd {np.std(latencies) * 1e3:.1f}, "
+        f"разброс {(np.max(latencies) - np.min(latencies)) * 1e3:.1f})"
+    )
+
+    # ------------------------------------------------------------------
+    # Что сделал фильтр с частотой стимуляции
+    # ------------------------------------------------------------------
+
+    if source == "filtered":
+        print(
+            "Затухание в фильтре: "
+            + format_attenuations(group["signature"], bandpass, fs)
+        )
+
+    else:
+        lost = attenuated_frequencies(group["signature"], bandpass, fs)
+
+        if lost:
+            print(
+                "ВНИМАНИЕ: выбран raw_*, потому что filtered_* гасит "
+                + ", ".join(f"{value:g} Гц" for value in lost)
+                + f" сильнее {MAX_ATTENUATION_DB:g} дБ.",
+                file=sys.stderr,
+            )
+
+    for key in DAC_FREQUENCY_KEYS:
+        result = group["coefficients"][key]
+
+        print()
+        print(f"{DAC_LABELS[key]} = {result['frequency']:.6f} Гц")
+
+        print(
+            f"{'Channel':<16}{'|C|':>11}{'Phase':>11}"
+            f"{'med|C|':>10}{'|C| mean':>11}"
+            f"{'ITC':>8}{'SNR':>8}{'n':>5}"
+        )
+        print("-" * 80)
+
+        for index, name in enumerate(channel_names):
+            print(
+                f"{name:<16}"
+                f"{result['amplitude'][index]:>11.4g}"
+                f"{result['phase'][index]:>10.2f}°"
+                f"{result['median_amplitude'][index]:>10.4g}"
+                f"{result['mean_amplitude'][index]:>11.4g}"
+                f"{result['itc'][index]:>8.3f}"
+                f"{result['snr'][index]:>8.2f}"
+                f"{result['n_accepted'][index]:>5d}"
+            )
+
+        # --------------------------------------------------------------
+        # Выбросы
+        # --------------------------------------------------------------
+
+        if outlier_threshold <= 0:
+            continue
+
+        for index, name in enumerate(channel_names):
+            rejected = ~result["accepted"][:, index]
+
+            if not rejected.any():
+                continue
+
+            amplitudes = np.abs(result["table"][:, index])
+
+            names = [
+                group["subjects"][row]
+                for row in np.flatnonzero(rejected)
+            ]
+
+            print()
+            print(
+                f"  Отброшено по {name}: {int(rejected.sum())} из "
+                f"{len(rejected)} (порог MAD x{outlier_threshold:g} "
+                "по |C|, либо NaN канала)"
+            )
+            print(f"    испытуемые: " + ", ".join(names))
+            print(
+                f"    их |C|: "
+                + ", ".join(
+                    f"{value:.3g}"
+                    for value in amplitudes[rejected]
+                )
+                + "; у принятых медиана "
+                f"{result['median_amplitude'][index]:.3g}"
+            )
+
+    # ------------------------------------------------------------------
+    # Согласованность с уровнем шума
+    # ------------------------------------------------------------------
+
+    n_epochs = group["n_epochs"]
+
+    noise_itc = 1.0 / np.sqrt(n_epochs)
+
+    weak = {}
+
+    for key in DAC_FREQUENCY_KEYS:
+        result = group["coefficients"][key]
+
+        names = []
+
+        for index, name in enumerate(channel_names):
+            itc = result["itc"][index]
+
+            if not np.isfinite(itc) or itc > noise_itc * 1.5:
+                continue
+
+            names.append(name)
+
+        if names:
+            weak[f"{result['frequency']:g} Гц"] = names
+
+    if weak:
+        print()
+        print(
+            f"  ВНИМАНИЕ: ITC не превышает шумовой уровень "
+            f"{noise_itc:.3f} ({n_epochs} эпох):"
+        )
+
+        for frequency, names in weak.items():
+            print(
+                f"    {frequency}: "
+                + ", ".join(names)
+                + f"  ({len(names)} из {len(channel_names)} каналов)"
+            )
+
+        print(
+            "    Когерентного ответа на этих частотах в данных нет "
+            "либо он замаскирован шумом. Это не ошибка расчёта."
+        )
+
+
+def print_summary(
+    groups: dict,
+    channel_names: list[str],
+):
+    """
+    Сводка по группам.
+
+    Строки ключуются КОНКРЕТНОЙ ЧАСТОТОЙ, а не именем слота DAC:
+    усреднять 12 Гц (шаг 3) с 55 Гц (шаг 7) в один столбец
+    «DAC0 f1» бессмысленно. В шаге 1 f1 == f2, поэтому без
+    агрегации по частоте строки дублировались бы.
+    """
+
+    if not groups:
+        return
+
+    rows = {}
+
+    for signature, group in groups.items():
+        for name in DAC_FREQUENCY_KEYS:
+            result = group["coefficients"][name]
+
+            frequency = result["frequency"]
+
+            entry = rows.setdefault(
+                frequency,
+                {
+                    "frequency": frequency,
+                    "dacs": set(),
+                    "steps": set(),
+                    "n_epochs": group["n_epochs"],
+                    "amplitude": result["amplitude"],
+                    "itc": result["itc"],
+                },
+            )
+
+            entry["dacs"].add(DAC_LABELS[name].split()[0])
+
+            entry["steps"].update(group["step_indices"])
+
+    print()
+    print("=" * 100)
+    print("СВОДКА ПО ЧАСТОТАМ")
+    print("=" * 100)
+
+    header = (
+        f"{'Частота':<10}{'DAC':<12}{'Шаги':<10}{'n':>4}"
+    )
+
+    header += "".join(
+        f"{name:>16}" for name in channel_names
+    )
+
+    print(header)
+    print("-" * len(header))
+
+    for frequency in sorted(rows):
+        row = rows[frequency]
+
+        line = (
+            f"{f'{frequency:g} Гц':<10}"
+            f"{'/'.join(sorted(row['dacs'])):<12}"
+            f"{','.join(str(value) for value in sorted(row['steps'])):<10}"
+            f"{row['n_epochs']:>4}"
+        )
+
+        for index in range(len(channel_names)):
+            amplitude = row["amplitude"][index]
+
+            itc = row["itc"][index]
+
+            if not np.isfinite(amplitude) or not np.isfinite(itc):
+                line += f"{'н/д':>16}"
+
+                continue
+
+            line += f"{amplitude:>10.3g} I{itc:>4.2f}"
+
+        print(line)
+
+    print()
+    print(
+        "Формат ячейки:  амплитуда |C| и ITC. "
+        "Сравнивать амплитуды можно только в строке одной частоты."
+    )
 
 
 # ============================================================================
@@ -2890,11 +3308,14 @@ def plan_sources(
 
     for file_path in files:
         try:
-            metadata, df = load_metadata_and_data(file_path)
+            metadata = load_metadata(file_path)
 
             step = extract_step_info(metadata)
 
-            candidate_fs = resolve_sampling_rate(metadata, df)
+            candidate_fs = resolve_sampling_rate(
+                metadata,
+                None,
+            )
 
             if not bandpass_known:
                 bandpass = get_bandpass_config(metadata)
@@ -2931,10 +3352,13 @@ def plan_sources(
         )
 
     # Группы с достаточным числом эпох.
+    #
+    # Считаются ФАЙЛЫ (`value["count"]`), а не номера шагов:
+    # один и тот же номер шага у разных испытуемых — разные эпохи.
     plan = {
         signature: value
         for signature, value in plan.items()
-        if len(value) >= min_epochs
+        if value["count"] >= min_epochs
     }
 
     if not plan:
@@ -3011,15 +3435,17 @@ def plan_sources(
 
 def process_folders(
     folder_paths: list[str],
-    window: float,
+    t_start: float | None = None,
+    t_stop: float | None = None,
     channels: list[int] | None = None,
     source: str = "auto",
     step_filter: list[int] | None = None,
-    guard: float = 0.1,
+    guard: float = 0.15,
     min_epochs: int = 2,
     compensate_latency: bool = True,
     window_function: str = "hann",
     outlier_threshold: float = 0.0,
+    trim_fraction: float = 0.1,
     rms_threshold: float = 3.0,
     make_plots: bool = True,
     output: Path | None = None,
@@ -3038,17 +3464,16 @@ def process_folders(
         загрузка данных
           ↓
         ось времени по индексу отсчёта (НЕ app_timestamp)
+          + компенсация задержки «событие -> первый отсчёт»
           ↓
-        компенсация задержки «событие -> первый отсчёт»
-          ↓
-        отсечение грязных краёв (--guard)
+        отбрасывание битых каналов (RMS) и обрывов записи
           ↓
         группировка по конфигурации стимуляции
           ↓
         когерентное усреднение комплексных коэффициентов
         + ITC + SNR
-        ↓
-        усреднение во времени
+          ↓
+        усреднение во времени на общей абсолютной сетке
     """
 
     files = collect_files(folder_paths)
@@ -3150,8 +3575,6 @@ def process_folders(
     # Анализ
     # ------------------------------------------------------------------
 
-    time_grid = build_time_grid(window, fs)
-
     results = {}
 
     figures = {}
@@ -3204,6 +3627,42 @@ def process_folders(
             outlier_threshold,
         )
 
+        group["source"] = source_name
+
+        # Сетка времени строится из СОБСТВЕННЫХ границ каждой группы,
+        # а не одна на весь запуск: у разных шагов разные
+        # длительности и разные задержки.
+        #
+        # Берётся ПЕРЕСЕЧЕНИЕ допустимых интервалов всех эпох
+        # группы, чтобы на краях сетки не было участков без данных
+        # (иначе count_valid = 0, average = NaN, и график начинался
+        # бы пустым отрезком).
+        bounds = [
+            epoch_time_bounds(epoch, guard, compensate_latency)
+            for epoch in group_epochs_list
+        ]
+
+        group_start = max(item[1] for item in bounds)
+
+        group_stop = min(item[2] for item in bounds)
+
+        if t_start is not None:
+            group_start = max(group_start, t_start)
+
+        if t_stop is not None:
+            group_stop = min(group_stop, t_stop)
+
+        if group_stop <= group_start:
+            raise ValueError(
+                f"Интервал анализа пуст: доступно "
+                f"[{max(i[1] for i in bounds):.3f}, "
+                f"{min(i[2] for i in bounds):.3f}] с "
+                f"(запрошено [{t_start}, {t_stop}]). "
+                "Уменьшите --guard."
+            )
+
+        group_grid = build_time_grid(group_start, group_stop, fs)
+
         (
             group_grid,
             average,
@@ -3211,11 +3670,16 @@ def process_folders(
             count_valid,
         ) = average_group(
             group_epochs_list,
-            time_grid,
-            len(channel_names),
+            group_grid,
             guard,
             compensate_latency,
+            trim_fraction,
         )
+
+        group["time_grid"] = group_grid
+        group["average"] = average
+        group["sem"] = sem
+        group["count_valid"] = count_valid
 
         results[signature] = group
 
@@ -3224,6 +3688,8 @@ def process_folders(
             channel_names,
             source_name,
             outlier_threshold,
+            bandpass,
+            fs,
         )
 
         if make_plots:
@@ -3242,7 +3708,6 @@ def process_folders(
                 sem,
                 channel_names,
                 group,
-                window,
                 source_name,
                 target,
             )
@@ -3259,7 +3724,7 @@ def process_folders(
         "fs": fs,
         "source": source_name,
         "channel_names": channel_names,
-        "time_grid": time_grid,
+        "bandpass": bandpass,
         "groups": results,
         "figures": figures,
     }
@@ -3294,13 +3759,26 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--range",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("T0", "T1"),
+        help=(
+            "Интервал усреднения во времени в секундах "
+            "относительно переключения частот. "
+            "По умолчанию: [0, конец шага]."
+        ),
+    )
+
+    parser.add_argument(
         "--window",
         "-w",
         type=float,
-        default=3.0,
+        default=None,
         help=(
-            "Длина временного окна в секундах для усреднения во времени. "
-            "По умолчанию: 3.0 (вся длительность шага)."
+            "Длина интервала от t=0 в секундах; сокращение для "
+            "--range 0 W."
         ),
     )
 
@@ -3312,8 +3790,9 @@ def main() -> int:
         default=None,
         metavar="N",
         help=(
-            "Индексы каналов. По умолчанию — все каналы "
-            "источника. Мёртвые (нулевые) каналы отбрасываются."
+            "Индексы каналов, НУМЕРАЦИЯ С НУЛЯ: -c 0 - это первый "
+            "канал источника (ch_1). По умолчанию — все каналы, "
+            "кроме нулевых (мёртвые отбрасываются автоматически)."
         ),
     )
 
@@ -3345,11 +3824,13 @@ def main() -> int:
     parser.add_argument(
         "--guard",
         type=float,
-        default=0.1,
+        default=0.15,
         help=(
-            "Отсечка начала и конца эпохи в секундах "
-            "(данные предыдущего шага + переходные процессы filtfilt). "
-            "По умолчанию: 0.1."
+            "Отсечка начала и конца эпохи в секундах, "
+            "отсчитываемая от переключения частот на Arduino. "
+            "Убирает данные, записанные ещё на частотах "
+            "предыдущего шага, и переходные процессы filtfilt "
+            "(~54 мс). По умолчанию: 0.15."
         ),
     )
 
@@ -3408,6 +3889,19 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--trim",
+        type=float,
+        default=0.1,
+        metavar="F",
+        help=(
+            "Доля отбрасываемых проб с каждой стороны при усреднении "
+            "во времени (усечённое среднее). Без этого график "
+            "определяется 2-3 артефактными пробами. "
+            "0 отключает усечение. По умолчанию: 0.1."
+        ),
+    )
+
+    parser.add_argument(
         "--output",
         "-o",
         type=Path,
@@ -3457,8 +3951,23 @@ def main() -> int:
     if not args.folder:
         parser.error("нужен --folder либо --self-test")
 
-    if args.window <= 0:
-        parser.error("--window должен быть больше 0.")
+    if args.range is not None and args.window is not None:
+        parser.error("задайте либо --range, либо --window, не оба.")
+
+    if args.range is not None:
+        t_start, t_stop = args.range
+
+    elif args.window is not None:
+        t_start, t_stop = 0.0, args.window
+
+    else:
+        t_start, t_stop = None, None
+
+    if t_start is not None and t_start < 0:
+        parser.error("--range: начало не может быть отрицательным.")
+
+    if t_stop is not None and t_stop <= 0:
+        parser.error("--range: конец должен быть больше 0.")
 
     if args.guard < 0:
         parser.error("--guard не может быть отрицательным.")
@@ -3469,13 +3978,17 @@ def main() -> int:
     if args.outlier_threshold < 0:
         parser.error("--outlier-threshold не может быть отрицательным.")
 
+    if not 0 <= args.trim < 0.5:
+        parser.error("--trim должен быть в [0, 0.5).")
+
     if args.rms_threshold < 0:
         parser.error("--rms-threshold не может быть отрицательным.")
 
     try:
         result = process_folders(
             args.folder,
-            args.window,
+            t_start,
+            t_stop,
             args.channels,
             source=args.source,
             step_filter=args.step,
@@ -3484,6 +3997,7 @@ def main() -> int:
             compensate_latency=args.compensate_latency,
             window_function=args.window_function,
             outlier_threshold=args.outlier_threshold,
+            trim_fraction=args.trim,
             rms_threshold=args.rms_threshold,
             make_plots=not args.no_plot,
             output=args.output,
