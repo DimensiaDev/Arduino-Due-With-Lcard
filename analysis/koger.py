@@ -1769,22 +1769,40 @@ def _nan_median_or_nan(values: np.ndarray) -> float:
     return float(np.median(values))
 
 
+# Относительная точность, ниже которой отклонение считается нулём.
+EPSILON = 1e-9
+
+
 def mad_scale(
     deviations: np.ndarray,
+    level: float = 1.0,
 ) -> float:
     """
     Масштаб устойчивой оценки разброса.
 
         MAD-sigma = 1.4826 * median(|v - median(v)|)
 
-    Если MAD равен нулю (больше половины значений совпадают),
-    используется МИНИМАЛЬНЫЙ ненулевой разброс, а НЕ максимальный:
-    иначе единственный выброс сам себе задаёт порог и всегда
-    проходит проверку.
+    ВАЖНО, что происходит при MAD = 0 (больше половины значений
+    совпадают, типично для «9 значений 5.0 и одно 1e6»).
+    Ни минимальный, ни максимальный непустой разброс здесь не
+    годятся:
+
+      * максимальный = собственный разброс выброса, и выброс
+        задаёт себе порог, из-за чего ВСЕГДА проходит проверку;
+      * минимальный непустой = тот же самый разброс, если
+        неповторяющихся значений ровно одно.
+
+    Поэтому при MAD = 0 масштаб берётся от МАСШТАБА САМИХ
+    ЗНАЧЕНИЙ: `level * EPSILON`, где `level` — их медиана.
+    Численно это соответствует различию на последних разрядах
+    double, то есть любой реальный выброс отсекается.
+
+    `level` = 0 или NaN (все значения нулевые) даёт абсолютный
+    минимум `np.finfo(float).tiny`.
     """
 
     if deviations.size == 0:
-        return np.finfo(float).eps
+        return np.finfo(float).tiny
 
     median = float(np.median(deviations))
 
@@ -1793,15 +1811,13 @@ def mad_scale(
     if scale > 0:
         return scale
 
-    nonzero = deviations[deviations > 0]
+    if np.isfinite(level):
+        scale = abs(float(level)) * EPSILON
 
-    if nonzero.size:
-        return max(
-            float(np.min(nonzero)),
-            np.finfo(float).eps,
-        )
+        if scale > 0:
+            return scale
 
-    return np.finfo(float).eps
+    return np.finfo(float).tiny
 
 
 def robust_mask(
@@ -1826,7 +1842,10 @@ def robust_mask(
 
     median = float(np.median(clean))
 
-    scale = mad_scale(np.abs(clean - median))
+    scale = mad_scale(
+        np.abs(clean - median),
+        level=median,
+    )
 
     return finite & (np.abs(values - median) <= threshold * scale)
 
@@ -1882,11 +1901,18 @@ def robust_mask_log(
 
     median = float(np.median(clean))
 
-    deviation = mad_scale(np.abs(clean - median))
-
     linear_median = float(np.median(values[finite]))
 
-    # Оба порога — ОТНОСИТЕЛЬНЫЕ к медиане, иначе на канале с
+    # При MAD_log = 0 масштаб берётся от масштаба самих значений
+    # (`level * EPSILON` в ЛИНЕЙНЫХ единицах), а не от log10:
+    # иначе 14.0 и 2000.0 отличаются на 2.15 десятичных порядка,
+    # и порог схлопывается до 10^(3*2.15) = 2.9e6 от медианы.
+    deviation = mad_scale(
+        np.abs(clean - median),
+        level=linear_median,
+    )
+
+    # Оба порога — ОТНОСИТЕЛЬНЫ к медиане, иначе на канале с
     # малым разбросом min_ratio сравнивался бы с абсолютной
     # величиной и не срабатывал бы.
     factor = max(
@@ -3177,7 +3203,68 @@ def run_self_test() -> int:
     # ------------------------------------------------------------------
 
     print()
-    print("6) Ось времени: независимость от сетки и корректность поворота")
+    print("6) Маски выбросов")
+    print("-" * 86)
+
+    # При MAD = 0 нельзя брать максимальный выброс как масштаб:
+    # тогда единственный выброс сам себе задаёт порог и проходит.
+    spikes = np.array([5.0] * 9 + [1e6])
+
+    kept = int(np.sum(robust_mask(spikes, 4.0)))
+
+    ok = kept == 9
+
+    failures += 0 if ok else 1
+
+    print(
+        f"   9 значений 5.0 и одно 1e6 (MAD = 0): "
+        f"оставлено {kept} из 10  ->  {'OK' if ok else 'ПРОВАЛ'}"
+    )
+
+    # Нормальный разброс не должен попадать под порог.
+    smooth = 20.0 * (1.0 + 0.01 * np.arange(30))
+
+    kept_smooth = int(np.sum(robust_mask_log(smooth, 3.0)))
+
+    ok = kept_smooth == 30
+
+    failures += 0 if ok else 1
+
+    print(
+        f"   плавный ряд 20.0…20.29 (разброс 1%): "
+        f"оставлено {kept_smooth} из 30  ->  {'OK' if ok else 'ПРОВАЛ'}"
+    )
+
+    # На канале с малым разбросом порог не должен схлопываться.
+    tight = 5.0 * (1.0 + 0.05 * np.array([-1.0, 1.0] + [0.0] * 28))
+
+    kept_tight = int(np.sum(robust_mask_log(tight, 3.0)))
+
+    ok = kept_tight == 30
+
+    failures += 0 if ok else 1
+
+    print(
+        f"   узкий канал ±5% (MAD_log10 мал, порог схлопывается): "
+        f"оставлено {kept_tight} из 30  ->  {'OK' if ok else 'ПРОВАЛ'}"
+    )
+
+    # Явный мусор должен отсекаться.
+    noisy = np.array([14.0] * 28 + [2000.0])
+
+    kept_noisy = int(np.sum(robust_mask_log(noisy, 3.0)))
+
+    ok = kept_noisy == 28
+
+    failures += 0 if ok else 1
+
+    print(
+        f"   28 значений 14.0 и одно 2000.0: "
+        f"оставлено {kept_noisy} из 29  ->  {'OK' if ok else 'ПРОВАЛ'}"
+    )
+
+    print()
+    print("7) Ось времени: независимость от сетки и корректность поворота")
     print("-" * 86)
 
     frequency = 10.0
