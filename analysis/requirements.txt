@@ -1,0 +1,14 @@
+# Зависимости для analysis/koger.py
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r analysis/requirements.txt
+#   .venv/bin/python analysis/koger.py --self-test
+#   .venv/bin/python analysis/koger.py --folder "analysis/experiments/*"
+#
+# scipy нужен только для точной АЧХ полосового фильтра (sosfreqz),
+# с помощью которой выбирается источник данных (filtered_* / raw_*).
+
+matplotlib>=3.7
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
