@@ -675,12 +675,21 @@ class MainWindow(QMainWindow):
             "dstat_cliplo1",
             "dstat_env1",
             "dstat_samps",
+            "ir_state",
+            "ir_raw",
+            "ir_volts",
+            "ir_span",
+            "ir_th",
         ):
             make_dbg_label(attr)
 
         self.dbg_checkbox = QCheckBox("DBG телеметрия")
         self.dbg_checkbox.setChecked(False)
         self.dbg_checkbox.toggled.connect(self._toggle_dbg)
+
+        self.ir_checkbox = QCheckBox("ИК-датчик (TCRT5000)")
+        self.ir_checkbox.setChecked(False)
+        self.ir_checkbox.toggled.connect(self._toggle_ir)
 
         self.autoscroll_cb = QCheckBox("Автопрокрутка")
         self.autoscroll_cb.setChecked(True)
@@ -966,6 +975,7 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(10)
         toolbar.addWidget(self.dbg_checkbox)
+        toolbar.addWidget(self.ir_checkbox)
         toolbar.addWidget(self.autoscroll_cb)
         toolbar.addStretch()
 
@@ -976,6 +986,7 @@ class MainWindow(QMainWindow):
         v.addLayout(toolbar)
 
         v.addWidget(self._build_debug_stats_panel())
+        v.addWidget(self._build_ir_panel())
 
         cmd_box, cmd_layout = self._make_subcard("Ручная команда", COLORS["accent2"])
         cmd_row = QHBoxLayout()
@@ -1180,6 +1191,41 @@ class MainWindow(QMainWindow):
         for idx, (label, value) in enumerate(metrics):
             row = idx // 4
             col = (idx % 4) * 2
+            caption = QLabel(label)
+            caption.setObjectName("metric_label")
+            value.setObjectName("metric_value")
+            grid.addWidget(caption, row, col)
+            grid.addWidget(value, row, col + 1)
+            grid.setColumnStretch(col + 1, 1)
+
+        layout.addLayout(grid)
+        return frame
+
+    def _build_ir_panel(self) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("subcard")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        title = QLabel("ИК-датчик TCRT5000 (аналоговый вход A0)")
+        title.setObjectName("subcard_title")
+        layout.addWidget(title)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(8)
+
+        metrics = (
+            ("Состояние", self.ir_state),
+            ("RAW (0…4095)", self.ir_raw),
+            ("Напряжение, В", self.ir_volts),
+            ("Мин / Макс за 100 мс", self.ir_span),
+            ("Порог срабатывания", self.ir_th),
+        )
+        for idx, (label, value) in enumerate(metrics):
+            row = idx // 3
+            col = (idx % 3) * 2
             caption = QLabel(label)
             caption.setObjectName("metric_label")
             value.setObjectName("metric_value")
@@ -2321,6 +2367,27 @@ class MainWindow(QMainWindow):
                 COLORS["text_dim"],
             )
 
+        elif d.get("ir"):
+            raw = d.get("raw", "?")
+            volts = float(d.get("v", 0.0))
+            refl = bool(d.get("ref"))
+            state = "ЕСТЬ отражение" if refl else "нет отражения"
+            self.ir_raw.setText(str(raw))
+            self.ir_volts.setText(f"{volts:.3f}")
+            self.ir_span.setText(f"{d.get('min', '?')} / {d.get('max', '?')}")
+            self.ir_th.setText(str(d.get("th", "?")))
+            self.ir_state.setText(state)
+            self.ir_state.setStyleSheet(
+                f"color:{COLORS['green'] if refl else COLORS['text_dim']};"
+                f"font-family:'JetBrains Mono';font-size:11px;font-weight:600;"
+            )
+            self._log(
+                f"[IR] raw={raw}  U={volts:.3f}В  "
+                f"мин/макс={d.get('min', '?')}/{d.get('max', '?')}  "
+                f"{state}  (порог {d.get('th', '?')})",
+                COLORS["accent2"] if refl else COLORS["text_dim"],
+            )
+
         elif d.get("status"):
             self._log(f"[STATUS] {json.dumps(d)}", COLORS["accent"])
         else:
@@ -2370,9 +2437,20 @@ class MainWindow(QMainWindow):
             "dstat_cliplo1",
             "dstat_env1",
             "dstat_samps",
+            "ir_state",
+            "ir_raw",
+            "ir_volts",
+            "ir_span",
+            "ir_th",
         ):
             getattr(self, attr).setText("—")
-        for attr in ("dstat_cliphi0", "dstat_cliplo0", "dstat_cliphi1", "dstat_cliplo1"):
+        for attr in (
+            "dstat_cliphi0",
+            "dstat_cliplo0",
+            "dstat_cliphi1",
+            "dstat_cliplo1",
+            "ir_state",
+        ):
             getattr(self, attr).setStyleSheet(
                 f"color:{COLORS['text_dim']};font-family:'JetBrains Mono';font-size:11px;"
             )
@@ -2389,6 +2467,11 @@ class MainWindow(QMainWindow):
 
     def _toggle_dbg(self, enabled: bool):
         cmd = "DBG ON" if enabled else "DBG OFF"
+        self._log(f"→ {cmd}", COLORS["accent2"])
+        self._send(cmd)
+
+    def _toggle_ir(self, enabled: bool):
+        cmd = "IR ON" if enabled else "IR OFF"
         self._log(f"→ {cmd}", COLORS["accent2"])
         self._send(cmd)
 
@@ -2731,6 +2814,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.serial.is_open:
             self._send("DBG OFF")
+            self._send("IR OFF")
         self._stop(export=False)
         if self.lsl_inlet is not None:
             try:

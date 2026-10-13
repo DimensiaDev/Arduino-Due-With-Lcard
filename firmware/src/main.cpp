@@ -13,6 +13,14 @@ static const int CMD_BUF_SIZE = 64;
 static const float ABS_GAIN_MAX = 20.0f;
 static const uint8_t NUM_DACS = 2;
 
+// TCRT5000 (аналоговый вход, см. tcrt5000_test.ino в корне репозитория)
+static const uint8_t IR_PIN = A0;            // ADC0/PA16 — не пересекается с DAC0/DAC1 (PB15/PB16)
+static const uint8_t IR_AVG_N = 8;           // окно усреднения
+static const uint16_t IR_ADC_MAX = 4095;
+static const float IR_VREF = 3.3f;
+static const uint16_t IR_TH_DEFAULT = 1500;  // raw < порога => есть отражение
+static const uint16_t IR_HY_DEFAULT = 200;   // гистерезис, чтобы состояние не дребезжало
+
 volatile float g_amp1 = 0.5f;
 volatile float g_phase1 = 0.0f;
 volatile float g_amp2 = 0.5f;
@@ -41,6 +49,19 @@ volatile uint32_t g_dbgClipHigh[NUM_DACS] = {0, 0};
 volatile uint32_t g_dbgClipLow[NUM_DACS] = {0, 0};
 volatile uint32_t g_dbgSamples = 0;
 volatile uint32_t g_isrUs = 0;
+
+volatile bool g_irEnabled = false;
+volatile uint16_t g_irRaw = 0;
+volatile uint16_t g_irMin = IR_ADC_MAX;
+volatile uint16_t g_irMax = 0;
+volatile bool g_irReflect = false;
+volatile uint16_t g_irTh = IR_TH_DEFAULT;
+volatile uint16_t g_irHyst = IR_HY_DEFAULT;
+
+uint16_t g_irBuf[IR_AVG_N] = {0};
+uint32_t g_irSum = 0;
+uint8_t g_irIdx = 0;
+uint8_t g_irFilled = 0;
 
 float clampAmplitude(float a) { return constrain(a, 0.0f, MAX_AMPLITUDE); }
 float clampDC(float dc) { return constrain(dc, 0.0f, MAX_DC); }
@@ -240,6 +261,59 @@ void printDebug() {
     Serial.println("}");
 }
 
+static uint32_t g_lastIrMs = 0;
+
+void pollIR() {
+    uint16_t s = (uint16_t)analogRead(IR_PIN);
+
+    g_irSum -= g_irBuf[g_irIdx];
+    g_irBuf[g_irIdx] = s;
+    g_irSum += s;
+    g_irIdx = (uint8_t)((g_irIdx + 1) % IR_AVG_N);
+    if (g_irFilled < IR_AVG_N) g_irFilled++;
+
+    uint16_t avg = (uint16_t)(g_irSum / g_irFilled);
+    g_irRaw = avg;
+
+    if (s < g_irMin) g_irMin = s;
+    if (s > g_irMax) g_irMax = s;
+
+    if (!g_irReflect && avg < g_irTh) {
+        g_irReflect = true;
+    } else if (g_irReflect && avg > (uint16_t)(g_irTh + g_irHyst)) {
+        g_irReflect = false;
+    }
+}
+
+void emitIR() {
+    uint16_t raw = g_irRaw;
+    uint16_t mn = g_irMin;
+    uint16_t mx = g_irMax;
+    bool refl = g_irReflect;
+
+    g_irMin = IR_ADC_MAX;
+    g_irMax = 0;
+
+    float volts = raw * IR_VREF / (float)IR_ADC_MAX;
+
+    Serial.print("{\"ir\":1");
+    Serial.print(",\"raw\":"); Serial.print(raw);
+    Serial.print(",\"v\":"); Serial.print(volts, 3);
+    Serial.print(",\"min\":"); Serial.print(mn);
+    Serial.print(",\"max\":"); Serial.print(mx);
+    Serial.print(",\"ref\":"); Serial.print(refl ? 1 : 0);
+    Serial.print(",\"th\":"); Serial.print(g_irTh);
+    Serial.println("}");
+}
+
+void printIR() {
+    if (!g_irEnabled) return;
+    uint32_t now = millis();
+    if (now - g_lastIrMs < 100) return;
+    g_lastIrMs = now;
+    emitIR();
+}
+
 char g_cmdBuf[CMD_BUF_SIZE];
 int g_cmdIdx = 0;
 
@@ -307,6 +381,25 @@ void processCommand(const char *cmd) {
         return;
     }
 
+    if (strncmp(cmd, "IR?", 3) == 0) {
+        emitIR();
+        return;
+    }
+
+    if (strncmp(cmd, "IR ", 3) == 0) {
+        const char *arg = cmd + 3;
+        if (strncmp(arg, "ON", 2) == 0) {
+            g_irEnabled = true;
+            Serial.println("OK IR ON");
+        } else if (strncmp(arg, "OFF", 3) == 0) {
+            g_irEnabled = false;
+            Serial.println("OK IR OFF");
+        } else {
+            Serial.println("ERR IR ON|OFF");
+        }
+        return;
+    }
+
     if (sscanf(cmd, "SET %7s %f", key, &val) == 2) {
         if (strcmp(key, "A1") == 0) {
             g_amp1 = clampAmplitude(val);
@@ -336,6 +429,12 @@ void processCommand(const char *cmd) {
             if (val > ABS_GAIN_MAX) val = ABS_GAIN_MAX;
             g_gainMax = val;
             Serial.print("OK GM="); Serial.println(g_gainMax, 4);
+        } else if (strcmp(key, "IRTH") == 0) {
+            g_irTh = (uint16_t)constrain(val, 0.0f, (float)IR_ADC_MAX);
+            Serial.print("OK IRTH="); Serial.println(g_irTh);
+        } else if (strcmp(key, "IRHY") == 0) {
+            g_irHyst = (uint16_t)constrain(val, 0.0f, 1000.0f);
+            Serial.print("OK IRHY="); Serial.println(g_irHyst);
         } else if (strcmp(key, "SR") == 0) {
             bool wasRunning = g_running;
             g_running = false;
@@ -374,10 +473,13 @@ void setup() {
     recomputeAllIncrements();
     setupTimer(g_sampleRate);
 
+    analogReadResolution(12);
+    pinMode(IR_PIN, INPUT);
+
     NVIC_SetPriority(UART_IRQn, 0);
     NVIC_SetPriority(TC6_IRQn, 1);
 
-    Serial.println("READY dual_dac_sine v4.0");
+    Serial.println("READY dual_dac_sine v4.1 (ir tcrt5000)");
 }
 
 void loop() {
@@ -395,4 +497,6 @@ void loop() {
     }
 
     printDebug();
+    pollIR();
+    printIR();
 }
