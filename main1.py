@@ -601,11 +601,17 @@ class LSLRecordingWorker(threading.Thread):
 class GazeEyesWidget(QWidget):
     """Наглядная индикация направления взгляда двумя «глазами».
 
-    Левый глаз соответствует ИК-датчику 0, правый — датчику 1. Состояния:
+    Глаза показаны «лицом к лицу», как реальные датчики расположены
+    относительно пользователя: ИК-датчик 0 отображается СПРАВА, датчик 1 —
+    СЛЕВА. Зрачки смещаются в ту же сторону, куда физически движутся зрачки
+    при взгляде влево/вправо (то есть взгляд «влево» на экране смещает
+    зрачки вправо). Датчики фиксируют ТОЛЬКО горизонтальное движение —
+    вертикальных смещений зрачка в индикаторе не бывает. Состояния:
       • датчик не подключён   — серо-белый глаз, зрачок по центру;
       • взгляд по центру      — зелёный глаз, зрачок по центру;
-      • взгляд смещён         — красный глаз, зрачок сдвинут в сторону
-                                отклонения (влево / вправо / вниз-в бок).
+      • взгляд смещён         — красный глаз, зрачок сдвинут влево/вправо
+                                по отклонению; если направление определить
+                                не удалось — зрачок по центру, глаз красный.
     Переходы (положение зрачка, цвет, свечение) плавно анимируются, а
     отклонённый глаз мягко пульсирует, чтобы привлекать внимание.
     """
@@ -623,7 +629,8 @@ class GazeEyesWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setToolTip(
             "Индикация взгляда: зелёный — взгляд в центре, "
-            "красный — смещён, серо-белый — датчик не подключён."
+            "красный — смещён (влево/вправо), серо-белый — датчик "
+            "не подключён. Датчики фиксируют только горизонтальное движение."
         )
 
         self._target = [self._blank_state(), self._blank_state()]
@@ -672,14 +679,19 @@ class GazeEyesWidget(QWidget):
                 target["dx"] = target["dy"] = 0.0
                 target["label"] = "центр"
             elif direction == "left":
-                target["dx"], target["dy"] = -1.0, 0.0
+                # Взгляд влево (в сторону левой руки пользователя): на экране
+                # глаза показаны «лицом к лицу», поэтому зрачки уходят ВПРАВО.
+                target["dx"], target["dy"] = 1.0, 0.0
                 target["label"] = "влево"
             elif direction == "right":
-                target["dx"], target["dy"] = 1.0, 0.0
+                # Зеркально: взгляд вправо → зрачки на экране уходят влево.
+                target["dx"], target["dy"] = -1.0, 0.0
                 target["label"] = "вправо"
             else:
-                # Направление неизвестно — показываем общее смещение вниз-в бок.
-                target["dx"], target["dy"] = 0.0, 1.0
+                # Датчики фиксируют только движение влево/вправо — вертикальных
+                # смещений в индикаторе не бывает. Если отклонение есть, а
+                # направление определить не удалось, зрачок остаётся по центру.
+                target["dx"] = target["dy"] = 0.0
                 target["label"] = "смещён"
 
     # ── Анимация ─────────────────────────────────────────────────────────────
@@ -739,8 +751,10 @@ class GazeEyesWidget(QWidget):
         radius = max(16.0, radius)
         center_y = eyes_top + eyes_h / 2.0
         center_x = content.center().x()
-        eye0_x = center_x - gap / 2.0 - radius
-        eye1_x = center_x + gap / 2.0 + radius
+        # Вид «лицом к лицу» (как датчики расположены в реальности):
+        # датчик 0 — справа на экране, датчик 1 — слева.
+        eye0_x = center_x + gap / 2.0 + radius
+        eye1_x = center_x - gap / 2.0 - radius
 
         for idx, eye_x in enumerate((eye0_x, eye1_x)):
             self._paint_eye(painter, eye_x, center_y, radius, self._current[idx])
@@ -815,11 +829,12 @@ class GazeEyesWidget(QWidget):
         if any(deviated):
             if all(deviated):
                 return "ВЗГЛЯД СМЕЩЁН", self._COLOR_ALERT
-            side = "0"
+            # Датчик 0 — правый глаз, датчик 1 — левый.
+            side = "ПРАВО"
             for i in range(2):
                 if deviated[i]:
-                    side = str(i)
-            return f"СМЕЩЁН · ДАТЧИК {side}", self._COLOR_ALERT
+                    side = "ПРАВО" if i == 0 else "ЛЕВО"
+            return f"СМЕЩЁН · {side}", self._COLOR_ALERT
         return "ВЗГЛЯД В ЦЕНТРЕ", self._COLOR_CENTER
 
     def _paint_eye(
@@ -947,7 +962,8 @@ class GazeEyesWidget(QWidget):
         painter.drawText(
             QRectF(cx - 70.0, bottom + 7.0, 140.0, 14.0),
             int(Qt.AlignmentFlag.AlignCenter),
-            f"ДАТЧИК {idx}",
+            # Датчик 0 — правый глаз, датчик 1 — левый.
+            "ПРАВО" if idx == 0 else "ЛЕВО",
         )
 
         state_font = QFont(self.font())
@@ -1043,6 +1059,9 @@ class MainWindow(QMainWindow):
         # Продолжение, которое запускается после успешной калибровки
         # (калибровка всегда выполняется перед стартом эксперимента).
         self._calibration_after = None
+        # Ожидание возврата взгляда в центр после калибровки: эксперимент
+        # стартует автоматически, как только оба датчика увидят центр.
+        self._waiting_gaze_center = False
         self._calibration_samples = [
             {"sensor0": [], "sensor1": []},
             {"sensor0": [], "sensor1": []},
@@ -1119,7 +1138,7 @@ class MainWindow(QMainWindow):
         self._init_debug_support_widgets()
 
         left = QVBoxLayout()
-        left.setSpacing(6)
+        left.setSpacing(12)
         top_cards = QHBoxLayout()
         top_cards.setSpacing(6)
         top_cards.addWidget(self._build_session_card(), 3)
@@ -1128,6 +1147,10 @@ class MainWindow(QMainWindow):
         left.addWidget(self._build_global_box())
         left.addWidget(self._build_sequence_box())
         left.addWidget(self._build_gaze_eyes_card())
+        # Баннер «Взгляд в норме / смещён» и строка датчиков — сразу под
+        # панелью глаз, единым блоком индикации взгляда.
+        left.addWidget(self.gaze_indicator)
+        left.addWidget(self.gaze_detail)
         left.addStretch()
 
         left_w = QWidget()
@@ -1197,9 +1220,11 @@ class MainWindow(QMainWindow):
         self.gaze_indicator.setMinimumHeight(48)
         self._set_gaze_indicator_style("forward")
 
-        self.gaze_detail = QLabel("Датчик 0: —   |   Датчик 1: —   |   Позиция: —")
+        self.gaze_detail = QLabel("Лево: —   |   Право: —   |   Позиция: —")
         self.gaze_detail.setObjectName("hint_label")
         self.gaze_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.gaze_detail.setWordWrap(True)
+        self.gaze_detail.setTextFormat(Qt.TextFormat.RichText)
 
     def _make_card(self, title: str, hint: str | None = None) -> tuple[QFrame, QVBoxLayout]:
         card = QFrame()
@@ -1298,9 +1323,6 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(w)
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(12)
-
-        v.addWidget(self.gaze_indicator)
-        v.addWidget(self.gaze_detail)
 
         lbl = QLabel("Этапы последовательности")
         lbl.setObjectName("section_label")
@@ -2338,20 +2360,42 @@ class MainWindow(QMainWindow):
     def _update_gaze_indicator_text(self):
         if not hasattr(self, "gaze_detail"):
             return
+        states = self._gaze_eye_states()
         with self._ir_lock:
             sensors = [dict(s) for s in self._ir_sensors]
 
+        # Цвет каждого значения: зелёный — взгляд по центру (у этого датчика),
+        # красный — смещён, серый — нет сигнала. Позиция — по общей
+        # классификации: зелёная только при «вперёд».
+        # Порядок в строке — как глаза на экране: сначала «Лево» (датчик 1),
+        # затем «Право» (датчик 0). Числа — показания АЦП датчиков.
+        sep = f'   <span style="color:{COLORS["text_dim"]};">|</span>   '
         parts = []
-        for i, s in enumerate(sensors):
-            if not s["available"]:
-                parts.append(f"Датчик {i}: —")
+        for i in (1, 0):
+            s = sensors[i]
+            state = states[i] if i < len(states) else {}
+            if not state.get("available"):
+                color = COLORS["text_dim"]
+            elif state.get("deviated"):
+                color = COLORS["red"]
             else:
-                raw_val = s.get("raw", np.nan)
-                raw_str = f"{int(raw_val)}" if np.isfinite(raw_val) else "—"
-                parts.append(f"Датчик {i}: raw={raw_str}")
-        parts.append(f"Позиция: {gaze_position_label(self._current_gaze_pos)}")
-        self.gaze_detail.setText("   |   ".join(parts))
-        self._update_gaze_eyes()
+                color = COLORS["green"]
+            raw_val = s.get("raw", np.nan)
+            raw_str = f"{int(raw_val)}" if np.isfinite(raw_val) else "—"
+            eye_name = "Лево" if i == 1 else "Право"
+            parts.append(
+                f'<span style="color:{color};">{eye_name}: {raw_str}</span>'
+            )
+
+        pos_color = COLORS["green"] if self._current_gaze_pos == "forward" else COLORS["red"]
+        pos_text = gaze_position_label(self._current_gaze_pos)
+        parts.append(f'<span style="color:{pos_color};">Позиция: {pos_text}</span>')
+
+        html = sep.join(parts)
+        if self.gaze_detail.text() != html:
+            self.gaze_detail.setText(html)
+        if hasattr(self, "gaze_eyes"):
+            self.gaze_eyes.set_eyes(states)
 
     def _gaze_eye_states(self) -> list[dict]:
         """Состояние каждого «глаза» (датчика) для индикатора взгляда.
@@ -2364,6 +2408,12 @@ class MainWindow(QMainWindow):
         гистерезисной памятью). Без калибровки смещение определяется по
         признаку «виден зрачок» (нет отражения), а направление — по общей
         классификации взгляда, если она известна.
+
+        Глаза человека сопряжены — смотреть врозь невозможно. Поэтому после
+        поканальной классификации применяется общее правило: если хотя бы
+        один датчик уверенно определил направление (влево/вправо), оно
+        засчитывается обоим глазам; если отклонение зафиксировано, но
+        направление неизвестно, смещёнными считаются оба глаза.
         """
         now = time.time()
         with self._ir_lock:
@@ -2373,18 +2423,21 @@ class MainWindow(QMainWindow):
         forward_ref = cal.get("forward") if isinstance(cal.get("forward"), dict) else {}
 
         states = []
+        scores: list[float | None] = []
         for idx, s in enumerate(sensors):
             last_update = float(s.get("last_update") or 0.0)
             fresh = bool(s.get("available")) and (now - last_update) <= IR_STALE_SECONDS
             if not fresh:
                 self._sensor_eye_pos[idx] = "forward"
                 states.append({"available": False, "deviated": False, "direction": "center"})
+                scores.append(None)
                 continue
 
             raw_val = s.get("raw", np.nan)
             f_ref = forward_ref.get(f"s{idx}", np.nan)
             deviated = False
             direction = "center"
+            score: float | None = None
 
             if np.isfinite(raw_val) and isinstance(f_ref, (int, float)) and np.isfinite(f_ref):
                 candidates = {"forward": abs(float(raw_val) - float(f_ref))}
@@ -2404,6 +2457,10 @@ class MainWindow(QMainWindow):
                 self._sensor_eye_pos[idx] = nearest
                 deviated = nearest != "forward"
                 direction = nearest if deviated else "center"
+                # Уверенность направления: насколько опорная точка отклонения
+                # ближе, чем «вперёд». Используется при сопряжении глаз.
+                if deviated:
+                    score = candidates["forward"] - candidates[nearest]
             else:
                 deviated = not bool(s.get("reflect", True))
                 if deviated:
@@ -2417,12 +2474,37 @@ class MainWindow(QMainWindow):
                     "direction": direction,
                 }
             )
-        return states
+            scores.append(score)
 
-    def _update_gaze_eyes(self):
-        if not hasattr(self, "gaze_eyes"):
-            return
-        self.gaze_eyes.set_eyes(self._gaze_eye_states())
+        # Сопряжённый взгляд: уверенное направление одного датчика
+        # распространяется на оба глаза.
+        best_direction = None
+        best_score = -1.0
+        for st, sc in zip(states, scores):
+            if not (st["available"] and st["deviated"]):
+                continue
+            if st["direction"] not in ("left", "right"):
+                continue
+            sc = 0.0 if sc is None else sc
+            if sc > best_score:
+                best_score = sc
+                best_direction = st["direction"]
+
+        if best_direction is not None:
+            for st in states:
+                if st["available"]:
+                    st["deviated"] = True
+                    st["direction"] = best_direction
+        elif any(st["available"] and st["deviated"] for st in states):
+            # Направление не смог определить ни один датчик, но отклонение
+            # зафиксировано — смещены оба глаза (сопряжённость).
+            for st in states:
+                if st["available"]:
+                    st["deviated"] = True
+                    if st["direction"] == "center":
+                        st["direction"] = "off"
+
+        return states
 
     def _classify_gaze_position(self) -> str:
         """Classify current gaze as 'forward', 'left', 'right', or 'off'.
@@ -2525,6 +2607,18 @@ class MainWindow(QMainWindow):
                     self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
                 elif not new_off and old_off:
                     self._resume_experiment()
+
+        # Ожидание старта после калибровки: взгляд вернулся в центр — запускаем.
+        if (
+            self._waiting_gaze_center
+            and not self._gaze_off
+            and not self._running
+            and not self._calibration_in_progress
+        ):
+            self._waiting_gaze_center = False
+            self.stop_btn.setEnabled(False)
+            self._log("Взгляд в центре — запуск эксперимента.", COLORS["green"])
+            QTimer.singleShot(250, self._start_experiment)
 
         self._update_gaze_indicator_text()
 
@@ -2712,7 +2806,9 @@ class MainWindow(QMainWindow):
         self._calibration_in_progress = False
         self._calibration_phase_collecting = False
         self._calibration_after = None
+        self._waiting_gaze_center = False
         self.start_btn.setEnabled(self.serial.is_open)
+        self.stop_btn.setEnabled(False)
         self._log(f"Калибровка не завершена ({reason}). Эксперимент не запущен.", COLORS["yellow"])
         self.status_bar.showMessage(f"Калибровка не завершена: {reason}")
 
@@ -3704,6 +3800,13 @@ class MainWindow(QMainWindow):
         if self._calibration_in_progress:
             self._log("Калибровка уже выполняется.", COLORS["yellow"])
             return
+        if self._waiting_gaze_center:
+            self._log(
+                "Старт уже ожидает возврата взгляда в центр — "
+                "эксперимент начнётся автоматически.",
+                COLORS["yellow"],
+            )
+            return
         if not self.serial.is_open:
             self._log("Нельзя начать: нет подключения к Arduino.", COLORS["red"])
             self.status_bar.showMessage("Подключитесь к Arduino перед стартом")
@@ -3717,9 +3820,17 @@ class MainWindow(QMainWindow):
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда."""
         if self._gaze_off:
-            self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
-            self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
-            self.start_btn.setEnabled(self.serial.is_open)
+            # Последняя фаза калибровки — «ВПРАВО»: взгляд ещё не успел
+            # вернуться в центр. Не считаем это ошибкой — ждём возврата
+            # взгляда и стартуем автоматически.
+            self._waiting_gaze_center = True
+            self._log(
+                "Калибровка завершена. Верните взгляд в центр — "
+                "эксперимент стартует автоматически.",
+                COLORS["accent"],
+            )
+            self.status_bar.showMessage("Верните взгляд в центр — эксперимент начнётся автоматически")
+            self.stop_btn.setEnabled(True)  # Стоп отменяет ожидание старта
             return
 
         if self.sequence_steps:
@@ -3760,6 +3871,11 @@ class MainWindow(QMainWindow):
 
     def _start_sequence(self):
         if not self.serial.is_open or not self.sequence_steps:
+            self._log(
+                "Старт последовательности невозможен: нет подключения к Arduino "
+                "или не загружен файл последовательности.",
+                COLORS["red"],
+            )
             self.start_btn.setEnabled(self.serial.is_open)
             return
         if self._gaze_off:
@@ -3903,6 +4019,9 @@ class MainWindow(QMainWindow):
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
         self._paused_by_gaze = False
+        if self._waiting_gaze_center:
+            self._waiting_gaze_center = False
+            self._log("Автостарт после калибровки отменён.", COLORS["yellow"])
         if self.sequence_steps:
             self._stop_sequence_progress()
         self._log("→ STOP", COLORS["red"])
@@ -3935,7 +4054,8 @@ class MainWindow(QMainWindow):
             self._auto_apply_timer.start(200)
             QTimer.singleShot(400, self._apply_calibration_to_firmware)
         else:
-            if self._running or self._recording_active:
+            if self._running or self._recording_active or self._waiting_gaze_center:
+                self._waiting_gaze_center = False
                 self._stop(reason="Serial отключен")
             self._sequence_timer.stop()
             self._set_serial_checkbox(False)
