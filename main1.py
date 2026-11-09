@@ -11,6 +11,7 @@ Usage:
 
 import sys
 import json
+import math
 import re
 import time
 import threading
@@ -50,8 +51,29 @@ except Exception as e:  # pragma: no cover - depends on local installation
     butter = filtfilt = iirnotch = lfilter = sosfilt = sosfiltfilt = None
     SCIPY_IMPORT_ERROR = e
 
-from PySide6.QtCore import QSettings, QTimer, Signal, QObject, Slot, Qt
-from PySide6.QtGui import QColor, QPalette, QTextCursor
+from PySide6.QtCore import (
+    QPointF,
+    QRectF,
+    QSettings,
+    QSize,
+    QTimer,
+    QObject,
+    Signal,
+    Slot,
+    Qt,
+)
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QRadialGradient,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -102,6 +124,11 @@ INVERT_SENSOR_RAW = True
 DEFAULT_GAZE_DIFF_THRESHOLD = 200.0
 GAZE_CLASSIFY_HYSTERESIS = 100.0
 MIN_CALIBRATION_SEPARATION = 80.0
+
+# Датчик считается отключённым, если от него давно нет телеметрии (с).
+# Прошивка шлёт данные каждые 100 мс, поэтому 3 с — это ~30 пропущенных
+# пакетов: надёжно ловит отключение и не срабатывает от кратких подвисаний UI.
+IR_STALE_SECONDS = 3.0
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 COLORS = {
@@ -570,6 +597,387 @@ class LSLRecordingWorker(threading.Thread):
                 self.samples.extend(rows)
 
 
+# ── Gaze eyes widget ──────────────────────────────────────────────────────────
+class GazeEyesWidget(QWidget):
+    """Наглядная индикация направления взгляда двумя «глазами».
+
+    Левый глаз соответствует ИК-датчику 0, правый — датчику 1. Состояния:
+      • датчик не подключён   — серо-белый глаз, зрачок по центру;
+      • взгляд по центру      — зелёный глаз, зрачок по центру;
+      • взгляд смещён         — красный глаз, зрачок сдвинут в сторону
+                                отклонения (влево / вправо / вниз-в бок).
+    Переходы (положение зрачка, цвет, свечение) плавно анимируются, а
+    отклонённый глаз мягко пульсирует, чтобы привлекать внимание.
+    """
+
+    _COLOR_CENTER = "#34d399"   # зелёный «взгляд в центре»
+    _COLOR_ALERT = "#f87171"    # красный «взгляд смещён»
+    _COLOR_IDLE = "#c3ccd6"     # серо-белый «датчик не подключён»
+    _PUPIL_RATIO = 0.32         # радиус зрачка относительно глаза
+    _IRIS_RATIO = 0.645
+    _SHIFT_RATIO = 0.30         # максимальный сдвиг зрачка (в пределах радужки)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(198)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setToolTip(
+            "Индикация взгляда: зелёный — взгляд в центре, "
+            "красный — смещён, серо-белый — датчик не подключён."
+        )
+
+        self._target = [self._blank_state(), self._blank_state()]
+        self._current = [self._blank_state(), self._blank_state()]
+        self._phase = 0.0
+        self._last_tick = time.monotonic()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    @staticmethod
+    def _blank_state() -> dict:
+        return {
+            "enabled": 0.0,
+            "mix": 0.0,
+            "dx": 0.0,
+            "dy": 0.0,
+            "label": "нет сигнала",
+        }
+
+    def sizeHint(self):
+        return QSize(420, 198)
+
+    # ── Внешний интерфейс ────────────────────────────────────────────────────
+    def set_eyes(self, eyes: list) -> None:
+        """Обновляет целевое состояние глаз.
+
+        ``eyes`` — список из двух словарей: ``available`` (датчик подключён),
+        ``deviated`` (взгляд смещён) и ``direction`` (left/right/off/center).
+        """
+        for i in range(2):
+            state = eyes[i] if i < len(eyes) and isinstance(eyes[i], dict) else {}
+            target = self._target[i]
+            available = bool(state.get("available"))
+            deviated = bool(state.get("deviated")) and available
+            target["enabled"] = 1.0 if available else 0.0
+            target["mix"] = 1.0 if deviated else 0.0
+
+            direction = state.get("direction", "center")
+            if not available:
+                target["dx"] = target["dy"] = 0.0
+                target["label"] = "нет сигнала"
+            elif not deviated:
+                target["dx"] = target["dy"] = 0.0
+                target["label"] = "центр"
+            elif direction == "left":
+                target["dx"], target["dy"] = -1.0, 0.0
+                target["label"] = "влево"
+            elif direction == "right":
+                target["dx"], target["dy"] = 1.0, 0.0
+                target["label"] = "вправо"
+            else:
+                # Направление неизвестно — показываем общее смещение вниз-в бок.
+                target["dx"], target["dy"] = 0.0, 1.0
+                target["label"] = "смещён"
+
+    # ── Анимация ─────────────────────────────────────────────────────────────
+    def _tick(self) -> None:
+        # Сглаживание привязано к реальному времени, поэтому анимация
+        # остаётся плавной и доходит до цели даже при редких перерисовках.
+        now = time.monotonic()
+        dt = min(0.25, max(0.001, now - self._last_tick))
+        self._last_tick = now
+        alpha = 1.0 - math.exp(-dt / 0.075)
+
+        changed = False
+        for i in range(2):
+            target, current = self._target[i], self._current[i]
+            for key in ("enabled", "mix", "dx", "dy"):
+                delta = target[key] - current[key]
+                if abs(delta) > 0.002:
+                    current[key] += delta * alpha
+                    changed = True
+                elif delta:
+                    current[key] = target[key]
+                    changed = True
+            if target["label"] != current["label"]:
+                current["label"] = target["label"]
+                changed = True
+
+        alerting = self._target[0]["mix"] > 0.01 or self._target[1]["mix"] > 0.01
+        if alerting:
+            self._phase = (self._phase + dt * 5.2) % (2.0 * math.pi)
+            changed = True
+
+        if changed:
+            self.update()
+
+    # ── Отрисовка ────────────────────────────────────────────────────────────
+    def paintEvent(self, event):  # noqa: N802 (Qt API)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        self._paint_panel(painter, rect)
+
+        header_h = 24.0
+        labels_h = 36.0
+        content = rect.adjusted(14.0, 10.0, -14.0, -10.0)
+        self._paint_header(painter, content, header_h)
+
+        eyes_top = content.top() + header_h
+        eyes_h = max(20.0, content.height() - header_h - labels_h)
+        gap = max(26.0, content.width() * 0.07)
+        radius = min(
+            52.0,
+            eyes_h / 2.0 - 2.0,
+            (content.width() - gap) / 4.0 - 2.0,
+        )
+        radius = max(16.0, radius)
+        center_y = eyes_top + eyes_h / 2.0
+        center_x = content.center().x()
+        eye0_x = center_x - gap / 2.0 - radius
+        eye1_x = center_x + gap / 2.0 + radius
+
+        for idx, eye_x in enumerate((eye0_x, eye1_x)):
+            self._paint_eye(painter, eye_x, center_y, radius, self._current[idx])
+            self._paint_eye_caption(
+                painter, eye_x, center_y + radius, idx, self._current[idx]
+            )
+
+    def _paint_panel(self, painter: QPainter, rect: QRectF) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(rect, 18.0, 18.0)
+
+        body = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        body.setColorAt(0.0, QColor("#18212e"))
+        body.setColorAt(0.55, QColor("#121a24"))
+        body.setColorAt(1.0, QColor("#0d141c"))
+        painter.fillPath(path, QBrush(body))
+
+        inner = QPainterPath()
+        inner.addRoundedRect(rect.adjusted(1.0, 1.0, -1.0, -1.0), 17.0, 17.0)
+        sheen = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + 30.0))
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 16))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillPath(inner, QBrush(sheen))
+
+        painter.setPen(QPen(QColor(COLORS["border"]), 1.0))
+        painter.drawPath(path)
+
+    def _paint_header(self, painter: QPainter, content: QRectF, header_h: float) -> None:
+        caption_font = QFont(self.font())
+        caption_font.setPointSizeF(8.2)
+        caption_font.setBold(True)
+        caption_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.6)
+        painter.setFont(caption_font)
+        painter.setPen(QColor(COLORS["text_dim"]))
+        painter.drawText(
+            QRectF(content.left() + 2.0, content.top(), content.width() * 0.6, header_h),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            "НАПРАВЛЕНИЕ ВЗГЛЯДА",
+        )
+
+        chip_text, chip_color = self._overall_status()
+        chip_font = QFont(self.font())
+        chip_font.setPointSizeF(8.4)
+        chip_font.setBold(True)
+        chip_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.6)
+        painter.setFont(chip_font)
+        metrics = painter.fontMetrics()
+        text_w = float(metrics.horizontalAdvance(chip_text))
+        chip_h = 20.0
+        chip_w = text_w + 22.0
+        chip = QRectF(content.right() - chip_w, content.top() + 2.0, chip_w, chip_h)
+
+        chip_path = QPainterPath()
+        chip_path.addRoundedRect(chip, chip_h / 2.0, chip_h / 2.0)
+        fill = QColor(chip_color)
+        fill.setAlpha(34)
+        edge = QColor(chip_color)
+        edge.setAlpha(150)
+        painter.fillPath(chip_path, QBrush(fill))
+        painter.setPen(QPen(edge, 1.0))
+        painter.drawPath(chip_path)
+        painter.setPen(QColor(chip_color))
+        painter.drawText(chip, int(Qt.AlignmentFlag.AlignCenter), chip_text)
+
+    def _overall_status(self) -> tuple:
+        available = [c["enabled"] > 0.5 for c in self._target]
+        deviated = [
+            available[i] and self._target[i]["mix"] > 0.5 for i in range(2)
+        ]
+        if not any(available):
+            return "НЕТ СИГНАЛА", self._COLOR_IDLE
+        if any(deviated):
+            if all(deviated):
+                return "ВЗГЛЯД СМЕЩЁН", self._COLOR_ALERT
+            side = "0"
+            for i in range(2):
+                if deviated[i]:
+                    side = str(i)
+            return f"СМЕЩЁН · ДАТЧИК {side}", self._COLOR_ALERT
+        return "ВЗГЛЯД В ЦЕНТРЕ", self._COLOR_CENTER
+
+    def _paint_eye(
+        self, painter: QPainter, cx: float, cy: float, radius: float, current: dict
+    ) -> None:
+        enabled = current["enabled"]
+        mix = current["mix"] * enabled
+        color = self._lerp_color(
+            self._lerp_color(QColor(self._COLOR_IDLE), QColor(self._COLOR_CENTER), enabled),
+            QColor(self._COLOR_ALERT),
+            mix,
+        )
+
+        pupil_dx = current["dx"] * radius * self._SHIFT_RATIO * enabled
+        pupil_dy = current["dy"] * radius * self._SHIFT_RATIO * enabled
+        pulse = 0.5 + 0.5 * math.sin(self._phase)
+
+        # Мягкая тень под глазом — глубина.
+        shadow = QRadialGradient(QPointF(cx, cy + radius * 0.86), radius * 1.05)
+        shadow.setColorAt(0.0, QColor(0, 0, 0, 110))
+        shadow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(shadow))
+        painter.drawEllipse(
+            QPointF(cx, cy + radius * 0.86), radius * 1.05, radius * 0.36
+        )
+
+        # Свечение состояния (для отклонения — пульсирующее).
+        glow_alpha = int(round(22 + 34 * enabled))
+        if mix > 0.01:
+            glow_alpha = int(round(46 + (72 + 46 * pulse) * mix))
+        glow = QRadialGradient(QPointF(cx, cy), radius * 2.0)
+        glow_core = QColor(color)
+        glow_core.setAlpha(glow_alpha)
+        glow_mid = QColor(color)
+        glow_mid.setAlpha(max(0, int(glow_alpha * 0.45)))
+        glow.setColorAt(0.0, glow_core)
+        glow.setColorAt(0.40, glow_mid)
+        glow.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0))
+        painter.setBrush(QBrush(glow))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QPointF(cx, cy), radius * 2.0, radius * 2.0)
+
+        # Ободок-оправа состояния.
+        rim = QColor(color)
+        rim.setAlpha(215)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(rim, 2.2))
+        painter.drawEllipse(QPointF(cx, cy), radius - 1.0, radius - 1.0)
+        halo = QColor(color)
+        halo.setAlpha(60)
+        painter.setPen(QPen(halo, 1.0))
+        painter.drawEllipse(QPointF(cx, cy), radius + 2.6, radius + 2.6)
+
+        # Склера — объёмный шар.
+        sclera = QRadialGradient(
+            QPointF(cx - radius * 0.30, cy - radius * 0.34), radius * 1.9
+        )
+        sclera.setColorAt(0.0, QColor("#fbfdff"))
+        sclera.setColorAt(0.55, QColor("#e6edf4"))
+        sclera.setColorAt(1.0, QColor("#c4ceda") if enabled > 0.5 else QColor("#c9cfd6"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(sclera))
+        painter.drawEllipse(QPointF(cx, cy), radius - 2.2, radius - 2.2)
+
+        # Тень верхнего века.
+        painter.save()
+        clip = QPainterPath()
+        clip.addEllipse(QPointF(cx, cy), radius - 2.2, radius - 2.2)
+        painter.setClipPath(clip)
+        lid = QLinearGradient(QPointF(cx, cy - radius), QPointF(cx, cy + radius * 0.15))
+        lid.setColorAt(0.0, QColor(9, 12, 18, 120))
+        lid.setColorAt(1.0, QColor(9, 12, 18, 0))
+        painter.setBrush(QBrush(lid))
+        painter.drawRect(QRectF(cx - radius, cy - radius, radius * 2.0, radius * 1.2))
+        painter.restore()
+
+        # Радужка и зрачок, смещённые по направлению взгляда.
+        iris_cx, iris_cy = cx + pupil_dx, cy + pupil_dy
+        iris_r = radius * self._IRIS_RATIO
+        iris = QRadialGradient(
+            QPointF(iris_cx - iris_r * 0.25, iris_cy - iris_r * 0.30), iris_r * 1.6
+        )
+        iris.setColorAt(0.0, color.lighter(126) if enabled > 0.5 else color.lighter(110))
+        iris.setColorAt(0.68, color)
+        iris.setColorAt(1.0, color.darker(158))
+        painter.setBrush(QBrush(iris))
+        painter.drawEllipse(QPointF(iris_cx, iris_cy), iris_r, iris_r)
+
+        iris_ring = color.darker(165)
+        iris_ring.setAlpha(190)
+        painter.setPen(QPen(iris_ring, 1.1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(iris_cx, iris_cy), iris_r, iris_r)
+
+        pupil_r = radius * self._PUPIL_RATIO
+        pupil = QRadialGradient(
+            QPointF(iris_cx - pupil_r * 0.2, iris_cy - pupil_r * 0.25), pupil_r * 1.8
+        )
+        pupil.setColorAt(0.0, QColor("#131c26"))
+        pupil.setColorAt(1.0, QColor("#05080c"))
+        painter.setBrush(QBrush(pupil))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QPointF(iris_cx, iris_cy), pupil_r, pupil_r)
+
+        # Блики — «мокрый» глянец.
+        painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
+        painter.drawEllipse(
+            QPointF(iris_cx - iris_r * 0.32, iris_cy - iris_r * 0.36), radius * 0.115, radius * 0.10
+        )
+        painter.setBrush(QBrush(QColor(255, 255, 255, 80)))
+        painter.drawEllipse(
+            QPointF(iris_cx + iris_r * 0.26, iris_cy + iris_r * 0.30), radius * 0.05, radius * 0.045
+        )
+
+    def _paint_eye_caption(
+        self, painter: QPainter, cx: float, bottom: float, idx: int, current: dict
+    ) -> None:
+        name_font = QFont(self.font())
+        name_font.setPointSizeF(7.6)
+        name_font.setBold(True)
+        name_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
+        painter.setFont(name_font)
+        painter.setPen(QColor(COLORS["text_dim"]))
+        painter.drawText(
+            QRectF(cx - 70.0, bottom + 7.0, 140.0, 14.0),
+            int(Qt.AlignmentFlag.AlignCenter),
+            f"ДАТЧИК {idx}",
+        )
+
+        state_font = QFont(self.font())
+        state_font.setPointSizeF(8.8)
+        state_font.setBold(True)
+        painter.setFont(state_font)
+        enabled = current["enabled"]
+        mix = current["mix"] * enabled
+        color = self._lerp_color(
+            self._lerp_color(QColor(self._COLOR_IDLE), QColor(self._COLOR_CENTER), enabled),
+            QColor(self._COLOR_ALERT),
+            mix,
+        )
+        painter.setPen(color)
+        painter.drawText(
+            QRectF(cx - 70.0, bottom + 21.0, 140.0, 15.0),
+            int(Qt.AlignmentFlag.AlignCenter),
+            current["label"],
+        )
+
+    @staticmethod
+    def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
+        t = max(0.0, min(1.0, t))
+        return QColor(
+            int(round(c1.red() + (c2.red() - c1.red()) * t)),
+            int(round(c1.green() + (c2.green() - c1.green()) * t)),
+            int(round(c1.blue() + (c2.blue() - c1.blue()) * t)),
+        )
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     _console_append = Signal(str, str)
@@ -624,6 +1032,7 @@ class MainWindow(QMainWindow):
         ]
         self._ir_events: list[dict] = []
         self._last_ir_reflect_state = [None, None]
+        self._sensor_eye_pos = ["forward", "forward"]
         self._ir_table_max_rows = 100
 
         # ── IR calibration (nearest-neighbor reference points) ──────────────
@@ -631,6 +1040,9 @@ class MainWindow(QMainWindow):
         self._calibration_in_progress = False
         self._calibration_phase = 0
         self._calibration_phase_collecting = False
+        # Продолжение, которое запускается после успешной калибровки
+        # (калибровка всегда выполняется перед стартом эксперимента).
+        self._calibration_after = None
         self._calibration_samples = [
             {"sensor0": [], "sensor1": []},
             {"sensor0": [], "sensor1": []},
@@ -715,6 +1127,7 @@ class MainWindow(QMainWindow):
         left.addLayout(top_cards)
         left.addWidget(self._build_global_box())
         left.addWidget(self._build_sequence_box())
+        left.addWidget(self._build_gaze_eyes_card())
         left.addStretch()
 
         left_w = QWidget()
@@ -736,7 +1149,6 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_preview_tab(), "Мониторинг")
-        self.tabs.addTab(self._build_cascade_tab(), "КАСКАД")
         self.tabs.addTab(self._build_service_tab(), "Сервис")
 
         right.addWidget(self.tabs, 1)
@@ -881,10 +1293,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lsl_status_label)
         return card
 
-    def _build_sequence_box(self) -> QFrame:
-        box, layout = self._make_subcard(
-            "Последовательность частот (настройка эксперимента)", COLORS["accent2"]
-        )
     def _build_preview_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
@@ -949,63 +1357,6 @@ class MainWindow(QMainWindow):
         v.addWidget(self._build_stats_panel())
         return w
 
-    def _build_cascade_tab(self) -> QWidget:
-        w = QWidget()
-        v = QVBoxLayout(w)
-        v.setContentsMargins(12, 12, 12, 12)
-        v.setSpacing(12)
-
-        v.addWidget(self.gaze_indicator)
-        v.addWidget(self.gaze_detail)
-
-        filter_label = QLabel("Фильтры записи")
-        filter_label.setObjectName("section_label")
-        v.addWidget(filter_label)
-
-        filter_box = QGroupBox("Фильтрация и экспорт")
-        filter_grid = QGridLayout(filter_box)
-        filter_grid.setHorizontalSpacing(10)
-        filter_grid.setVerticalSpacing(8)
-
-        self.bandpass_enabled = QCheckBox("Полосовой")
-        self.bandpass_enabled.setChecked(True)
-        filter_grid.addWidget(self.bandpass_enabled, 0, 0)
-
-        self.bandpass_low = make_spinbox(0.01, 5000.0, 2, 0.5, 0.5, "Гц")
-        self.bandpass_high = make_spinbox(0.01, 5000.0, 2, 1.0, 40.0, "Гц")
-        self.bandpass_order = QSpinBox()
-        self.bandpass_order.setRange(1, 12)
-        self.bandpass_order.setValue(4)
-        filter_grid.addWidget(QLabel("Низ"), 1, 0)
-        filter_grid.addWidget(self.bandpass_low, 1, 1)
-        filter_grid.addWidget(QLabel("Верх"), 2, 0)
-        filter_grid.addWidget(self.bandpass_high, 2, 1)
-        filter_grid.addWidget(QLabel("Порядок"), 3, 0)
-        filter_grid.addWidget(self.bandpass_order, 3, 1)
-
-        self.notch_enabled = QCheckBox("Режекторный")
-        self.notch_enabled.setChecked(True)
-        filter_grid.addWidget(self.notch_enabled, 0, 2)
-
-        self.notch_freq = make_spinbox(0.01, 5000.0, 2, 1.0, 50.0, "Гц")
-        self.notch_q = make_spinbox(0.1, 500.0, 1, 1.0, 30.0, "Q")
-        filter_grid.addWidget(QLabel("Частота"), 1, 2)
-        filter_grid.addWidget(self.notch_freq, 1, 3)
-        filter_grid.addWidget(QLabel("Q"), 2, 2)
-        filter_grid.addWidget(self.notch_q, 2, 3)
-
-        self.recording_status_label = QLabel("Запись: ожидание")
-        self.recording_status_label.setObjectName("status_value")
-        filter_grid.addWidget(self.recording_status_label, 4, 0, 1, 4)
-
-        self.export_last_btn = QPushButton("Экспорт последней записи в TXT")
-        self.export_last_btn.clicked.connect(self._export_lsl_recording)
-        self.export_last_btn.setEnabled(False)
-        filter_grid.addWidget(self.export_last_btn, 5, 0, 1, 4)
-        v.addWidget(filter_box)
-        v.addStretch()
-        return w
-
     def _build_service_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
@@ -1056,6 +1407,17 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.sequence_clear_btn)
         layout.addLayout(btn_row)
         return box
+
+    def _build_gaze_eyes_card(self) -> QWidget:
+        self.gaze_eyes = GazeEyesWidget()
+        # До подключения датчиков глаза серо-белые, зрачки по центру.
+        self.gaze_eyes.set_eyes(
+            [
+                {"available": False, "deviated": False, "direction": "center"},
+                {"available": False, "deviated": False, "direction": "center"},
+            ]
+        )
+        return self.gaze_eyes
 
     def _build_global_box(self) -> QFrame:
         box, layout = self._make_subcard("Общие параметры", COLORS["accent"])
@@ -1218,18 +1580,13 @@ class MainWindow(QMainWindow):
         self.calibration_status_label.setWordWrap(True)
         layout.addWidget(self.calibration_status_label)
 
-        calib_btn_row = QHBoxLayout()
-        calib_btn_row.setSpacing(8)
-        self.calibration_btn = QPushButton("Предварительная настройка")
-        self.calibration_btn.setObjectName("ghost_btn")
-        self.calibration_btn.clicked.connect(self._start_calibration)
-        calib_btn_row.addWidget(self.calibration_btn)
-
-        self.calibration_reset_btn = QPushButton("Сбросить калибровку")
-        self.calibration_reset_btn.setObjectName("clear_btn")
-        self.calibration_reset_btn.clicked.connect(self._reset_calibration)
-        calib_btn_row.addWidget(self.calibration_reset_btn)
-        layout.addLayout(calib_btn_row)
+        calib_hint = QLabel(
+            "Калибровка выполняется автоматически перед каждым стартом "
+            "эксперимента: ВЛЕВО → ВПЕРЁД → ВПРАВО, по 3 секунды на фазу."
+        )
+        calib_hint.setObjectName("hint_label")
+        calib_hint.setWordWrap(True)
+        layout.addWidget(calib_hint)
 
         hist_label = QLabel("История показаний (последние 100 замеров)")
         hist_label.setObjectName("section_label")
@@ -1853,14 +2210,15 @@ class MainWindow(QMainWindow):
             self._sequence_total_start_time = None
 
     def _get_filter_config(self) -> dict:
+        # Фильтры экспорта заданы фиксированно — в UI полей настройки больше нет.
         return {
-            "bandpass_enabled": self.bandpass_enabled.isChecked(),
-            "bandpass_low_hz": self.bandpass_low.value(),
-            "bandpass_high_hz": self.bandpass_high.value(),
-            "bandpass_order": self.bandpass_order.value(),
-            "notch_enabled": self.notch_enabled.isChecked(),
-            "notch_hz": self.notch_freq.value(),
-            "notch_q": self.notch_q.value(),
+            "bandpass_enabled": True,
+            "bandpass_low_hz": 0.5,
+            "bandpass_high_hz": 40.0,
+            "bandpass_order": 4,
+            "notch_enabled": True,
+            "notch_hz": 50.0,
+            "notch_q": 30.0,
         }
 
     def _validate_lsl_recording_ready(self) -> bool:
@@ -1993,6 +2351,78 @@ class MainWindow(QMainWindow):
                 parts.append(f"Датчик {i}: raw={raw_str}")
         parts.append(f"Позиция: {gaze_position_label(self._current_gaze_pos)}")
         self.gaze_detail.setText("   |   ".join(parts))
+        self._update_gaze_eyes()
+
+    def _gaze_eye_states(self) -> list[dict]:
+        """Состояние каждого «глаза» (датчика) для индикатора взгляда.
+
+        Возвращает по датчику: ``available`` (есть свежая телеметрия),
+        ``deviated`` (взгляд смещён) и ``direction`` (left/right/off/center).
+
+        При наличии калибровки направление берётся из ближайшей опорной точки
+        этого датчика (одномерный nearest neighbor по его raw со своей
+        гистерезисной памятью). Без калибровки смещение определяется по
+        признаку «виден зрачок» (нет отражения), а направление — по общей
+        классификации взгляда, если она известна.
+        """
+        now = time.time()
+        with self._ir_lock:
+            sensors = [dict(s) for s in self._ir_sensors]
+            global_pos = self._current_gaze_pos
+        cal = self.ir_calibration if isinstance(self.ir_calibration, dict) else {}
+        forward_ref = cal.get("forward") if isinstance(cal.get("forward"), dict) else {}
+
+        states = []
+        for idx, s in enumerate(sensors):
+            last_update = float(s.get("last_update") or 0.0)
+            fresh = bool(s.get("available")) and (now - last_update) <= IR_STALE_SECONDS
+            if not fresh:
+                self._sensor_eye_pos[idx] = "forward"
+                states.append({"available": False, "deviated": False, "direction": "center"})
+                continue
+
+            raw_val = s.get("raw", np.nan)
+            f_ref = forward_ref.get(f"s{idx}", np.nan)
+            deviated = False
+            direction = "center"
+
+            if np.isfinite(raw_val) and isinstance(f_ref, (int, float)) and np.isfinite(f_ref):
+                candidates = {"forward": abs(float(raw_val) - float(f_ref))}
+                for name in ("left", "right"):
+                    ref = cal.get(name)
+                    ref_val = ref.get(f"s{idx}", np.nan) if isinstance(ref, dict) else np.nan
+                    if isinstance(ref_val, (int, float)) and np.isfinite(ref_val):
+                        candidates[name] = abs(float(raw_val) - float(ref_val))
+                nearest = min(candidates, key=candidates.get)
+                current = self._sensor_eye_pos[idx]
+                if (
+                    current in candidates
+                    and current != nearest
+                    and candidates[current] - candidates[nearest] < GAZE_CLASSIFY_HYSTERESIS
+                ):
+                    nearest = current
+                self._sensor_eye_pos[idx] = nearest
+                deviated = nearest != "forward"
+                direction = nearest if deviated else "center"
+            else:
+                deviated = not bool(s.get("reflect", True))
+                if deviated:
+                    direction = global_pos if global_pos in ("left", "right") else "off"
+                self._sensor_eye_pos[idx] = "forward" if not deviated else direction
+
+            states.append(
+                {
+                    "available": True,
+                    "deviated": deviated,
+                    "direction": direction,
+                }
+            )
+        return states
+
+    def _update_gaze_eyes(self):
+        if not hasattr(self, "gaze_eyes"):
+            return
+        self.gaze_eyes.set_eyes(self._gaze_eye_states())
 
     def _classify_gaze_position(self) -> str:
         """Classify current gaze as 'forward', 'left', 'right', or 'off'.
@@ -2239,18 +2669,26 @@ class MainWindow(QMainWindow):
             self._send(f"SET IRHY{idx} {hysteresis}")
         self._log("Пороги прошивки обновлены (только для отображения).", COLORS["green"])
 
-    def _start_calibration(self):
-        if not self.serial.is_open:
-            QMessageBox.warning(
-                self, "Калибровка", "Сначала подключитесь к Arduino по Serial."
-            )
-            return
+    def _start_calibration(self, after=None) -> bool:
+        """Запускает калибровку взгляда с первой фазы.
+
+        ``after`` — необязательная функция, которая будет вызвана после
+        успешного завершения калибровки (так старт эксперимента продолжается
+        автоматически). Возвращает False, если калибровку начать нельзя.
+        """
         if self._calibration_in_progress:
-            return
+            return False
+        if not self.serial.is_open:
+            self._log(
+                "Калибровка невозможна: нет подключения к Arduino по Serial.",
+                COLORS["red"],
+            )
+            self.status_bar.showMessage("Нет подключения к Arduino для калибровки")
+            return False
         if self._running:
             self._stop(reason="Калибровка")
-            time.sleep(0.3)
 
+        self._calibration_after = after
         self._calibration_in_progress = True
         self._calibration_phase = 0
         self._calibration_phase_collecting = False
@@ -2259,13 +2697,24 @@ class MainWindow(QMainWindow):
             {"sensor0": [], "sensor1": []},
             {"sensor0": [], "sensor1": []},
         ]
-        self._log("═══ Старт предварительной настройки (3 фазы) ═══", COLORS["accent"])
+        self._log("═══ Калибровка взгляда: всегда перед стартом (3 фазы) ═══", COLORS["accent"])
         self._log(
             "Будут записаны точки: ВЛЕВО → ВПЕРЁД → ВПРАВО. "
             "Каждая фаза — 3 секунды.",
             COLORS["accent"],
         )
+        self.status_bar.showMessage("Калибровка взгляда: ВЛЕВО → ВПЕРЁД → ВПРАВО")
         QTimer.singleShot(100, self._show_calibration_phase_dialog)
+        return True
+
+    def _calibration_abort(self, reason: str) -> None:
+        """Прерывает калибровку: эксперимент не стартует, кнопки возвращаются."""
+        self._calibration_in_progress = False
+        self._calibration_phase_collecting = False
+        self._calibration_after = None
+        self.start_btn.setEnabled(self.serial.is_open)
+        self._log(f"Калибровка не завершена ({reason}). Эксперимент не запущен.", COLORS["yellow"])
+        self.status_bar.showMessage(f"Калибровка не завершена: {reason}")
 
     def _show_calibration_phase_dialog(self):
         if not self._calibration_in_progress:
@@ -2287,12 +2736,11 @@ class MainWindow(QMainWindow):
         )
         msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
         msg.setDefaultButton(QMessageBox.Ok)
+        msg.setInformativeText(msg.informativeText() + "\n\n«Отмена» — эксперимент не будет запущен.")
         result = msg.exec()
 
         if result != QMessageBox.Ok:
-            self._calibration_in_progress = False
-            self._calibration_phase_collecting = False
-            self._log("Калибровка отменена пользователем.", COLORS["yellow"])
+            self._calibration_abort("отменена пользователем")
             return
 
         self._calibration_samples[self._calibration_phase] = {
@@ -2359,6 +2807,7 @@ class MainWindow(QMainWindow):
                     "(вкладка «Сервис» → История показаний)."
                 )
                 self._update_calibration_status_label()
+                self._calibration_abort(f"фаза «{phase_name}»: мало данных")
                 return
             med[phase_name] = {"s0": s0, "s1": s1}
             self._log(
@@ -2397,66 +2846,48 @@ class MainWindow(QMainWindow):
                 "видит зрачок (raw заметно меняется)."
             )
             self._update_calibration_status_label()
+            self._calibration_abort("точки «влево»/«вправо» слишком близки к «вперёд»")
             return
 
         self.ir_calibration = {"left": l, "forward": f, "right": r}
         self._save_calibration()
         self._apply_calibration_to_firmware()
-        self._update_calibration_status_label()
-        self._update_gaze_indicator_text()
-
-        lines = [
-            f"влево:  sensor0={l['s0']:.0f}, sensor1={l['s1']:.0f}",
-            f"вперёд: sensor0={f['s0']:.0f}, sensor1={f['s1']:.0f}",
-            f"вправо: sensor0={r['s0']:.0f}, sensor1={r['s1']:.0f}",
-            "",
-            f"Расстояния: left↔forward={d_lf:.0f}, right↔forward={d_rf:.0f}",
-        ]
-        QMessageBox.information(
-            self, "Калибровка завершена",
-            "Сохранённые точки (в инвертированной шкале, где белок = низкий raw):\n\n"
-            + "\n".join(lines) +
-            "\n\nПри работе программы текущие показания датчиков "
-            "сравниваются с этими точками; выбирается ближайшая. "
-            "Если ближайшая — «вперёд», взгляд считается нормальным, "
-            "иначе эксперимент ставится на паузу."
-        )
-        self._log(
-            f"Калибровка сохранена: "
-            f"forward=({f['s0']:.0f},{f['s1']:.0f}), "
-            f"left=({l['s0']:.0f},{l['s1']:.0f}), "
-            f"right=({r['s0']:.0f},{r['s1']:.0f})",
-            COLORS["green"],
-        )
-
-    def _reset_calibration(self):
-        # Порог по умолчанию для прошивки — в её собственной (неинвертированной) шкале.
-        default_th_fw = 1500
-        default_hy = 200
-
-        if self.serial.is_open:
-            self._send(f"SET IRTH0 {default_th_fw}")
-            self._send(f"SET IRHY0 {default_hy}")
-            self._send(f"SET IRTH1 {default_th_fw}")
-            self._send(f"SET IRHY1 {default_hy}")
-
-        self.ir_calibration = {}
+        # После калибровки отсчёт взгляда начинается заново: последняя фаза
+        # была «ВПРАВО», поэтому без сброса старт считался бы смещённым.
         self._current_gaze_pos = "forward"
         self._gaze_off = False
-        try:
-            self.settings.remove("ir/calibration")
-        except Exception:
-            pass
+        self._sensor_eye_pos = ["forward", "forward"]
         self._update_calibration_status_label()
         self._update_gaze_indicator_text()
         self._set_gaze_indicator_style("forward")
+
+        self._log("Калибровка взгляда завершена и сохранена:", COLORS["green"])
         self._log(
-            "Калибровка сброшена. Режим по умолчанию: "
-            f"взгляд вперёд при |s0-s1| < {int(DEFAULT_GAZE_DIFF_THRESHOLD)} "
-            "(в инвертированной шкале).",
-            COLORS["accent"],
+            f"   влево:  sensor0={l['s0']:.0f}, sensor1={l['s1']:.0f}",
+            COLORS["text_dim"],
         )
-        self.status_bar.showMessage("Калибровка сброшена")
+        self._log(
+            f"   вперёд: sensor0={f['s0']:.0f}, sensor1={f['s1']:.0f}",
+            COLORS["text_dim"],
+        )
+        self._log(
+            f"   вправо: sensor0={r['s0']:.0f}, sensor1={r['s1']:.0f}",
+            COLORS["text_dim"],
+        )
+        self._log(
+            f"   расстояния: left↔forward={d_lf:.0f}, right↔forward={d_rf:.0f}",
+            COLORS["text_dim"],
+        )
+
+        after = self._calibration_after
+        self._calibration_after = None
+        if after is not None:
+            self.status_bar.showMessage("Калибровка завершена — запуск эксперимента")
+            # Небольшая пауза, чтобы пришли свежие отсчёты датчиков и
+            # классификация взгляда обновилась по новой калибровке.
+            QTimer.singleShot(400, after)
+        else:
+            self.status_bar.showMessage("Калибровка завершена")
 
     # ── Pause / resume ───────────────────────────────────────────────────────
     def _pause_experiment(self, reason: str = "пауза"):
@@ -2527,7 +2958,6 @@ class MainWindow(QMainWindow):
 
         with self.lsl_sample_lock:
             self.lsl_samples.clear()
-        self.export_last_btn.setEnabled(False)
         with self._stim_lock:
             self._stim_events = []
         with self._ir_lock:
@@ -2553,7 +2983,6 @@ class MainWindow(QMainWindow):
             error_signal=self._lsl_worker_error,
         )
         self._recording_active = True
-        self.recording_status_label.setText("Запись: идет")
         self.lsl_worker.start()
         self._log("LSL-запись начата.", COLORS["green"])
         return True
@@ -2571,8 +3000,6 @@ class MainWindow(QMainWindow):
 
         with self.lsl_sample_lock:
             count = len(self.lsl_samples)
-        self.recording_status_label.setText(f"Запись: остановлена | отсчетов: {count}")
-        self.export_last_btn.setEnabled(bool(count))
         if count:
             self._log(f"LSL-запись остановлена: отсчетов {count}.", COLORS["green"])
         else:
@@ -2900,18 +3327,27 @@ class MainWindow(QMainWindow):
 
     def _refresh_signal_stats(self):
         p = self._get_params()
-        t = np.linspace(0, 0.1, 50000)
+        # 8000 точек достаточно для пиков/минимумов и клиппинга, но в разы
+        # дешевле для цикла событий, чем 50000 — анимации остаются плавными.
+        t = np.linspace(0, 0.1, 8000)
         raw0, sig0 = self._build_channel_signal(p, p["dac0_f1"], p["dac0_f2"], t)
         raw1, sig1 = self._build_channel_signal(p, p["dac1_f1"], p["dac1_f2"], t)
-        self.clip_label.setText(self._check_clipping(raw0, raw1))
 
-        self.stat_dac0_peak.setText(f"{np.max(sig0):.3f} В")
-        self.stat_dac0_trough.setText(f"{np.min(sig0):.3f} В")
-        self.stat_dac0_range.setText(f"{np.max(sig0) - np.min(sig0):.3f} В")
-        self.stat_dac1_peak.setText(f"{np.max(sig1):.3f} В")
-        self.stat_dac1_trough.setText(f"{np.min(sig1):.3f} В")
-        self.stat_dac1_range.setText(f"{np.max(sig1) - np.min(sig1):.3f} В")
-        self.stat_nyquist.setText(f"{p['sr']/2:.0f} Гц")
+        values = (
+            (self.clip_label, self._check_clipping(raw0, raw1)),
+            (self.stat_dac0_peak, f"{np.max(sig0):.3f} В"),
+            (self.stat_dac0_trough, f"{np.min(sig0):.3f} В"),
+            (self.stat_dac0_range, f"{np.max(sig0) - np.min(sig0):.3f} В"),
+            (self.stat_dac1_peak, f"{np.max(sig1):.3f} В"),
+            (self.stat_dac1_trough, f"{np.min(sig1):.3f} В"),
+            (self.stat_dac1_range, f"{np.max(sig1) - np.min(sig1):.3f} В"),
+            (self.stat_nyquist, f"{p['sr']/2:.0f} Гц"),
+        )
+        # Обновляем только изменившиеся надписи — иначе каждые 250 мс
+        # запускается переразметка панели и страдает плавность анимаций.
+        for label, text in values:
+            if label.text() != text:
+                label.setText(text)
 
     # ── Serial telemetry drain ────────────────────────────────────────────────
     def _drain_serial(self):
@@ -3264,9 +3700,26 @@ class MainWindow(QMainWindow):
         return True
 
     def _start(self):
+        """Старт эксперимента: сначала ВСЕГДА калибровка взгляда с нуля."""
+        if self._calibration_in_progress:
+            self._log("Калибровка уже выполняется.", COLORS["yellow"])
+            return
+        if not self.serial.is_open:
+            self._log("Нельзя начать: нет подключения к Arduino.", COLORS["red"])
+            self.status_bar.showMessage("Подключитесь к Arduino перед стартом")
+            return
+
+        self.start_btn.setEnabled(False)
+        # После успешной калибровки эксперимент стартует автоматически.
+        if not self._start_calibration(after=self._start_experiment):
+            self.start_btn.setEnabled(self.serial.is_open)
+
+    def _start_experiment(self):
+        """Продолжение старта — вызывается сразу после калибровки взгляда."""
         if self._gaze_off:
             self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
             self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
+            self.start_btn.setEnabled(self.serial.is_open)
             return
 
         if self.sequence_steps:
@@ -3274,10 +3727,12 @@ class MainWindow(QMainWindow):
             return
 
         if not self._validate_lsl_recording_ready():
+            self.start_btn.setEnabled(self.serial.is_open)
             return
 
         self._auto_apply_timer.stop()
         if not self._apply_params():
+            self.start_btn.setEnabled(self.serial.is_open)
             return
         time.sleep(0.05)
         self._log("→ START", COLORS["green"])
@@ -3292,6 +3747,7 @@ class MainWindow(QMainWindow):
                 dac1_f2=p["dac1_f2"],
             ):
                 self._send("STOP")
+                self.start_btn.setEnabled(self.serial.is_open)
                 return
             self._running = True
             self.start_btn.setEnabled(False)
@@ -3299,15 +3755,20 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("▶ Выполняется")
             self._log("▶ Выполняется", COLORS["green"])
             self._send("DBG ON")
+        else:
+            self.start_btn.setEnabled(self.serial.is_open)
 
     def _start_sequence(self):
         if not self.serial.is_open or not self.sequence_steps:
+            self.start_btn.setEnabled(self.serial.is_open)
             return
         if self._gaze_off:
             self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
             self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
+            self.start_btn.setEnabled(self.serial.is_open)
             return
         if not self._validate_lsl_recording_ready():
+            self.start_btn.setEnabled(self.serial.is_open)
             return
 
         self._auto_apply_timer.stop()
