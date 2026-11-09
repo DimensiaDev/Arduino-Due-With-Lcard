@@ -303,9 +303,6 @@ QTextEdit {{
 QLineEdit {{
     font-size: 11px;
 }}
-QLineEdit#command_input {{
-    font-family: 'JetBrains Mono', 'Consolas', monospace;
-}}
 QTabWidget::pane {{
     border: 1px solid {COLORS['border']};
     background-color: {COLORS['surface']};
@@ -652,6 +649,16 @@ class MainWindow(QMainWindow):
         self.lsl_worker: LSLRecordingWorker | None = None
         self.lsl_samples: list[dict] = []
         self.lsl_sample_lock = threading.Lock()
+        # Эксперимент полностью задаётся загруженной последовательностью частот,
+        # поэтому отдельных полей амплитуды/фазы/частот в UI больше нет.
+        self.amp1 = 0.5
+        self.amp2 = 0.5
+        self.phase1 = 0.0
+        self.phase2 = 0.0
+        self.dac0_f1 = 100.0
+        self.dac0_f2 = 200.0
+        self.dac1_f1 = 100.0
+        self.dac1_f2 = 200.0
         self._record_sequence_steps: list[SequenceStep] = []
         self._stim_lock = threading.Lock()
         self._stim_events: list[dict] = []
@@ -706,8 +713,8 @@ class MainWindow(QMainWindow):
         top_cards.addWidget(self._build_session_card(), 3)
         top_cards.addWidget(self._build_transport_box(), 2)
         left.addLayout(top_cards)
-        left.addWidget(self._build_signal_card())
-        left.addWidget(self._build_experiment_card())
+        left.addWidget(self._build_global_box())
+        left.addWidget(self._build_sequence_box())
         left.addStretch()
 
         left_w = QWidget()
@@ -729,7 +736,7 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_preview_tab(), "Мониторинг")
-        self.tabs.addTab(self._build_lsl_tab(), "LSL")
+        self.tabs.addTab(self._build_cascade_tab(), "КАСКАД")
         self.tabs.addTab(self._build_service_tab(), "Сервис")
 
         right.addWidget(self.tabs, 1)
@@ -768,25 +775,9 @@ class MainWindow(QMainWindow):
         ):
             make_dbg_label(attr)
 
-        self.dbg_checkbox = QCheckBox("DBG телеметрия")
-        self.dbg_checkbox.setChecked(False)
-        self.dbg_checkbox.toggled.connect(self._toggle_dbg)
-
-        self.ir_checkbox = QCheckBox("ИК-датчик (TCRT5000)")
-        self.ir_checkbox.setChecked(False)
-        self.ir_checkbox.toggled.connect(self._toggle_ir)
-
-        self.autoscroll_cb = QCheckBox("Автопрокрутка")
-        self.autoscroll_cb.setChecked(True)
-
         self.console = QTextEdit()
         self.console.setReadOnly(True)
         self.console.setPlaceholderText("Журнал команд и ответов Arduino")
-
-        self.cmd_input = QLineEdit()
-        self.cmd_input.setObjectName("command_input")
-        self.cmd_input.setPlaceholderText("Введите команду Arduino вручную")
-        self.cmd_input.returnPressed.connect(self._send_manual_cmd)
 
         self.gaze_indicator = QLabel("Взгляд в норме.")
         self.gaze_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -890,26 +881,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lsl_status_label)
         return card
 
-    def _build_signal_card(self) -> QFrame:
-        card, layout = self._make_card("Сигнал")
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(10)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.addWidget(self._build_sine_box("Синус 1", "1", COLORS["sine1"]), 0, 0)
-        grid.addWidget(self._build_sine_box("Синус 2", "2", COLORS["sine2"]), 0, 1)
-        grid.addWidget(self._build_dac_box("DAC0 (канал 1)", "dac0", COLORS["accent"]), 1, 0)
-        grid.addWidget(self._build_dac_box("DAC1 (канал 2)", "dac1", COLORS["combined"]), 1, 1)
-        layout.addLayout(grid)
-        return card
-
-    def _build_experiment_card(self) -> QFrame:
-        card, layout = self._make_card("Эксперимент")
-        layout.addWidget(self._build_global_box())
-        layout.addWidget(self._build_sequence_box())
-        return card
-
+    def _build_sequence_box(self) -> QFrame:
+        box, layout = self._make_subcard(
+            "Последовательность частот (настройка эксперимента)", COLORS["accent2"]
+        )
     def _build_preview_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
@@ -974,31 +949,14 @@ class MainWindow(QMainWindow):
         v.addWidget(self._build_stats_panel())
         return w
 
-    def _build_lsl_tab(self) -> QWidget:
+    def _build_cascade_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(12)
 
-        lsl_label = QLabel("Поток и запись LSL")
-        lsl_label.setObjectName("section_label")
-        v.addWidget(lsl_label)
-
-        stream_box = QGroupBox("Информация о потоке")
-        stream_grid = QGridLayout(stream_box)
-        stream_grid.setHorizontalSpacing(10)
-        stream_grid.setVerticalSpacing(10)
-
-        lsl_hint_label = QLabel("Выбор потока и подключение находятся в карточке «Сеанс» слева.")
-        lsl_hint_label.setObjectName("hint_label")
-        lsl_hint_label.setWordWrap(True)
-        stream_grid.addWidget(lsl_hint_label, 0, 0, 1, 3)
-
-        self.lsl_meta_text = QTextEdit()
-        self.lsl_meta_text.setReadOnly(True)
-        self.lsl_meta_text.setMinimumHeight(150)
-        stream_grid.addWidget(self.lsl_meta_text, 1, 0, 1, 3)
-        v.addWidget(stream_box)
+        v.addWidget(self.gaze_indicator)
+        v.addWidget(self.gaze_detail)
 
         filter_label = QLabel("Фильтры записи")
         filter_label.setObjectName("section_label")
@@ -1056,9 +1014,6 @@ class MainWindow(QMainWindow):
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(10)
-        toolbar.addWidget(self.dbg_checkbox)
-        toolbar.addWidget(self.ir_checkbox)
-        toolbar.addWidget(self.autoscroll_cb)
         toolbar.addStretch()
 
         clear_btn = QPushButton("Очистить журнал")
@@ -1070,73 +1025,10 @@ class MainWindow(QMainWindow):
         v.addWidget(self._build_debug_stats_panel())
         v.addWidget(self._build_ir_panel())
 
-        cmd_box, cmd_layout = self._make_subcard("Ручная команда", COLORS["accent2"])
-        cmd_row = QHBoxLayout()
-        cmd_row.setSpacing(8)
-        cmd_row.addWidget(self.cmd_input, 1)
-        send_btn = QPushButton("Отправить")
-        send_btn.setObjectName("ghost_btn")
-        send_btn.clicked.connect(self._send_manual_cmd)
-        cmd_row.addWidget(send_btn)
-        cmd_layout.addLayout(cmd_row)
-        v.addWidget(cmd_box)
-
         console_box, console_layout = self._make_subcard("Журнал", COLORS["accent"])
         console_layout.addWidget(self.console, 1)
         v.addWidget(console_box, 1)
         return w
-
-    def _build_sine_box(self, title: str, idx: str, color: str) -> QFrame:
-        box, layout = self._make_subcard(title, color)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        grid.setColumnStretch(1, 1)
-
-        def row(label, widget):
-            r = grid.rowCount()
-            grid.addWidget(self._make_field_label(label), r, 0)
-            grid.addWidget(widget, r, 1)
-
-        if idx == "1":
-            self.amp1 = make_spinbox(0, 1.65, 3, 0.05, 0.5, "В")
-            self.phase1 = make_spinbox(-360, 360, 1, 5.0, 0.0, "°")
-            for c in (self.amp1, self.phase1):
-                c.valueChanged.connect(self._param_changed)
-            row("Амплитуда", self.amp1)
-            row("Фаза", self.phase1)
-        else:
-            self.amp2 = make_spinbox(0, 1.65, 3, 0.05, 0.5, "В")
-            self.phase2 = make_spinbox(-360, 360, 1, 5.0, 0.0, "°")
-            for c in (self.amp2, self.phase2):
-                c.valueChanged.connect(self._param_changed)
-            row("Амплитуда", self.amp2)
-            row("Фаза", self.phase2)
-        layout.addLayout(grid)
-        return box
-
-    def _build_dac_box(self, title: str, attr_prefix: str, color: str) -> QFrame:
-        box, layout = self._make_subcard(title, color)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        grid.setColumnStretch(1, 1)
-
-        def row(label, widget):
-            r = grid.rowCount()
-            grid.addWidget(self._make_field_label(label), r, 0)
-            grid.addWidget(widget, r, 1)
-
-        freq1 = make_spinbox(0, 5000, 2, 10.0, 100.0, "Гц")
-        freq2 = make_spinbox(0, 5000, 2, 10.0, 200.0, "Гц")
-        freq1.valueChanged.connect(self._param_changed)
-        freq2.valueChanged.connect(self._param_changed)
-        setattr(self, f"{attr_prefix}_f1", freq1)
-        setattr(self, f"{attr_prefix}_f2", freq2)
-        row("Частота 1", freq1)
-        row("Частота 2", freq2)
-        layout.addLayout(grid)
-        return box
 
     def _build_sequence_box(self) -> QFrame:
         box, layout = self._make_subcard("Последовательность частот", COLORS["accent2"])
@@ -1492,7 +1384,6 @@ class MainWindow(QMainWindow):
             self.lsl_stream_combo.addItem("(pylsl недоступен)")
             self.lsl_status_label.setText(msg)
             self._set_lsl_checkbox(False, enabled=False)
-            self.lsl_meta_text.setPlainText(msg)
             return
 
         try:
@@ -1509,7 +1400,6 @@ class MainWindow(QMainWindow):
             self.lsl_stream_combo.addItem("(LSL-потоки не найдены)")
             self.lsl_status_label.setText("LSL-потоки не найдены")
             self._set_lsl_checkbox(False, enabled=False)
-            self.lsl_meta_text.clear()
             return
 
         for info in self.lsl_streams:
@@ -1522,8 +1412,6 @@ class MainWindow(QMainWindow):
         self.lsl_status_label.setText(f"Найдено LSL-потоков: {len(self.lsl_streams)}")
         connected = self.lsl_inlet is not None
         self._set_lsl_checkbox(connected, enabled=True)
-        if not connected:
-            self.lsl_meta_text.clear()
         self._update_lsl_stream_preview()
 
     def _update_lsl_stream_preview(self):
@@ -1532,7 +1420,7 @@ class MainWindow(QMainWindow):
             return
         meta = self._read_lsl_stream_meta(self.lsl_streams[idx])
         names = self._read_lsl_channel_names(self.lsl_streams[idx], meta["channel_count"])
-        self.lsl_meta_text.setPlainText(
+        self.lsl_status_label.setToolTip(
             "\n".join(
                 [
                     f"имя: {meta['name']}",
@@ -1674,14 +1562,14 @@ class MainWindow(QMainWindow):
 
     def _get_params(self) -> dict:
         return {
-            "a1": self.amp1.value(),
-            "p1": self.phase1.value(),
-            "a2": self.amp2.value(),
-            "p2": self.phase2.value(),
-            "dac0_f1": self.dac0_f1.value(),
-            "dac0_f2": self.dac0_f2.value(),
-            "dac1_f1": self.dac1_f1.value(),
-            "dac1_f2": self.dac1_f2.value(),
+            "a1": self.amp1,
+            "p1": self.phase1,
+            "a2": self.amp2,
+            "p2": self.phase2,
+            "dac0_f1": self.dac0_f1,
+            "dac0_f2": self.dac0_f2,
+            "dac1_f1": self.dac1_f1,
+            "dac1_f2": self.dac1_f2,
             "dc": self.dc_offset.value(),
             "sr": self.sample_rate.value(),
             "gain_max": self.gain_max.value(),
@@ -1715,10 +1603,9 @@ class MainWindow(QMainWindow):
         self.sequence_path_edit.setText(Path(path).name)
         self.sequence_path_edit.setToolTip(path)
         self.sequence_status.setText(
-            f"Шагов: {len(steps)} | всего: {total_seconds:.3f} с | частоты DAC0/DAC1 игнорируются"
+            f"Шагов: {len(steps)} | всего: {total_seconds:.3f} с"
         )
         self.sequence_clear_btn.setEnabled(True)
-        self._set_frequency_controls_enabled(False)
         self._populate_sequence_table()
         self._reset_sequence_progress(total_seconds)
         self.tabs.setCurrentIndex(0)
@@ -1738,10 +1625,9 @@ class MainWindow(QMainWindow):
         self.sequence_path_edit.setToolTip("")
         self.sequence_status.setText("Формат: D0F1 D0F2 D1F1 D1F2 сек")
         self.sequence_clear_btn.setEnabled(False)
-        self._set_frequency_controls_enabled(True)
         self._populate_sequence_table()
         self._reset_sequence_progress()
-        self._log("Файл частот сброшен. Поля DAC0/DAC1 снова активны.", COLORS["text_dim"])
+        self._log("Файл частот сброшен.", COLORS["text_dim"])
 
     def _parse_sequence_file(self, path: str) -> list[SequenceStep]:
         steps = []
@@ -1797,10 +1683,6 @@ class MainWindow(QMainWindow):
         if not steps:
             raise ValueError("в файле нет строк последовательности")
         return steps
-
-    def _set_frequency_controls_enabled(self, enabled: bool):
-        for widget in (self.dac0_f1, self.dac0_f2, self.dac1_f1, self.dac1_f2):
-            widget.setEnabled(enabled)
 
     def _sequence_total_seconds(self) -> float:
         return sum(step.seconds for step in self.sequence_steps)
@@ -2261,8 +2143,7 @@ class MainWindow(QMainWindow):
             for col, item in enumerate(items):
                 self.ir_table.setItem(row, col, item)
             self.ir_table.setRowHeight(row, 28)
-            if self.autoscroll_cb.isChecked():
-                self.ir_table.scrollToBottom()
+            self.ir_table.scrollToBottom()
         except Exception:
             pass
 
@@ -2362,13 +2243,6 @@ class MainWindow(QMainWindow):
         if not self.serial.is_open:
             QMessageBox.warning(
                 self, "Калибровка", "Сначала подключитесь к Arduino по Serial."
-            )
-            return
-        if not self.ir_checkbox.isChecked():
-            QMessageBox.warning(
-                self,
-                "Калибровка",
-                "Включите галочку «ИК-датчик (TCRT5000)» на вкладке «Сервис».",
             )
             return
         if self._calibration_in_progress:
@@ -2630,8 +2504,7 @@ class MainWindow(QMainWindow):
         else:
             if self.serial.is_open:
                 self._send("START")
-                if self.dbg_checkbox.isChecked():
-                    self._send("DBG ON")
+                self._send("DBG ON")
 
     def _begin_lsl_recording(
         self,
@@ -3206,9 +3079,8 @@ class MainWindow(QMainWindow):
         fmt.setForeground(QColor(color))
         cursor.setCharFormat(fmt)
         cursor.insertText(text + "\n")
-        if self.autoscroll_cb.isChecked():
-            self.console.setTextCursor(cursor)
-            self.console.ensureCursorVisible()
+        self.console.setTextCursor(cursor)
+        self.console.ensureCursorVisible()
 
     def _clear_console(self):
         self.console.clear()
@@ -3242,30 +3114,6 @@ class MainWindow(QMainWindow):
             getattr(self, attr).setStyleSheet(
                 f"color:{COLORS['text_dim']};font-family:'JetBrains Mono';font-size:11px;"
             )
-
-    def _send_manual_cmd(self):
-        cmd = self.cmd_input.text().strip()
-        if not cmd:
-            return
-        self._log(f"→ {cmd}", COLORS["accent2"])
-        resp = self._send(cmd)
-        if resp is None:
-            self._log("(нет ответа / не подключено)", COLORS["red"])
-        self.cmd_input.clear()
-
-    def _toggle_dbg(self, enabled: bool):
-        cmd = "DBG ON" if enabled else "DBG OFF"
-        self._log(f"→ {cmd}", COLORS["accent2"])
-        self._send(cmd)
-
-    def _toggle_ir(self, enabled: bool):
-        cmd = "IR ON" if enabled else "IR OFF"
-        self._log(f"→ {cmd}", COLORS["accent2"])
-        self._send(cmd)
-        if not enabled:
-            with self._ir_lock:
-                for s in self._ir_sensors:
-                    s["available"] = False
 
     # ── Serial actions ────────────────────────────────────────────────────────
     def _toggle_connect(self, checked: bool):
@@ -3318,7 +3166,7 @@ class MainWindow(QMainWindow):
         self._apply_params(include_frequencies=not bool(self.sequence_steps))
         if self.sequence_steps:
             self._log(
-                "Поля частот DAC0/DAC1 игнорируются, потому что загружен файл последовательности.",
+                "Частоты задаются загруженным файлом последовательности.",
                 COLORS["text_dim"],
             )
 
@@ -3432,8 +3280,6 @@ class MainWindow(QMainWindow):
         if not self._apply_params():
             return
         time.sleep(0.05)
-        if self.ir_checkbox.isChecked():
-            self._send("IR ON")
         self._log("→ START", COLORS["green"])
         resp = self._send("START")
         if resp and "OK" in resp:
@@ -3452,8 +3298,7 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(True)
             self.status_bar.showMessage("▶ Выполняется")
             self._log("▶ Выполняется", COLORS["green"])
-            if self.dbg_checkbox.isChecked():
-                self._send("DBG ON")
+            self._send("DBG ON")
 
     def _start_sequence(self):
         if not self.serial.is_open or not self.sequence_steps:
@@ -3522,8 +3367,6 @@ class MainWindow(QMainWindow):
                 self._abort_sequence("serial-порт не подключен")
                 return
             time.sleep(0.05)
-            if self.ir_checkbox.isChecked():
-                self._send("IR ON")
             self._log("→ START", COLORS["green"])
             resp = self._send("START")
             if not resp or "OK" not in resp:
@@ -3547,8 +3390,7 @@ class MainWindow(QMainWindow):
                     step.dac1_f1,
                     step.dac1_f2,
                 )
-            if self.dbg_checkbox.isChecked():
-                self._send("DBG ON")
+            self._send("DBG ON")
         else:
             if not self._apply_sequence_step_params(step, include_static=False):
                 self._abort_sequence("serial-порт не подключен")
@@ -3615,7 +3457,7 @@ class MainWindow(QMainWindow):
         self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
         self.status_bar.showMessage(f"■ {reason}")
         self._log(f"■ {reason}", COLORS["red"])
-        if self.dbg_checkbox.isChecked() and self.serial.is_open:
+        if self.serial.is_open:
             self._send("DBG OFF")
 
     # ── Connected slot ────────────────────────────────────────────────────────
@@ -3625,10 +3467,10 @@ class MainWindow(QMainWindow):
             self._set_serial_checkbox(True)
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            if self.ir_checkbox.isChecked():
-                self._send("IR ON")
-            else:
-                self._send("IR OFF")
+            # ИК-датчик (TCRT5000) включён по умолчанию при подключении.
+            self._send("IR ON")
+            # DBG-телеметрия включена по умолчанию при подключении.
+            self._send("DBG ON")
             self._auto_apply_timer.start(200)
             QTimer.singleShot(400, self._apply_calibration_to_firmware)
         else:
