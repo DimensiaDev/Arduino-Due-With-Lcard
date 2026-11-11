@@ -2488,6 +2488,20 @@ class MainWindow(QMainWindow):
             f"padding:10px;"
         )
 
+    def _has_calibration_data(self) -> bool:
+        """Есть ли сохранённая (валидная) калибровка взгляда.
+
+        Проверка взгляда при старте имеет смысл только если есть опорные
+        точки — иначе классификация опирается на резервную логику по
+        признаку отражения, которая без калибровки может давать ложные
+        срабатывания и блокировать запуск.
+        """
+        return bool(
+            isinstance(self.ir_calibration, dict)
+            and "forward" in self.ir_calibration
+            and isinstance(self.ir_calibration["forward"], dict)
+        )
+
     def _on_calibration_enabled_changed(self, checked: bool):
         """Включение/выключение автоматической калибровки при старте.
 
@@ -4181,19 +4195,34 @@ class MainWindow(QMainWindow):
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда
         (или напрямую, если калибровка при старте отключена)."""
-        if self._gaze_off and not self._ignore_gaze:
-            # Последняя фаза калибровки — «ВПРАВО»: взгляд ещё не успел
-            # вернуться в центр. Не считаем это ошибкой — ждём возврата
-            # взгляда и стартуем автоматически.
+        # Проверка взгляда при старте имеет смысл только когда есть
+        # сохранённая калибровка. Без опорных точек классификация опирается
+        # на резервную логику (reflect) и может давать ложные срабатывания,
+        # из-за которых эксперимент не запускается вовсе. Поэтому без
+        # калибровки старт выполняется независимо от направления взгляда
+        # (но пауза по взгляду во время эксперимента продолжает работать,
+        # если не включено «Игнорировать направление взгляда»).
+        has_cal = self._has_calibration_data()
+        gaze_blocks_start = (
+            self._gaze_off
+            and not self._ignore_gaze
+            and has_cal
+        )
+        if gaze_blocks_start:
             self._waiting_gaze_center = True
             self._log(
-                "Калибровка завершена. Верните взгляд в центр — "
-                "эксперимент стартует автоматически.",
+                "Верните взгляд в центр — эксперимент стартует автоматически.",
                 COLORS["accent"],
             )
             self.status_bar.showMessage("Верните взгляд в центр — эксперимент начнётся автоматически")
             self.stop_btn.setEnabled(True)  # Стоп отменяет ожидание старта
             return
+        if self._gaze_off and not self._ignore_gaze and not has_cal:
+            self._log(
+                "Взгляд определён как смещённый, но калибровка отсутствует — "
+                "проверка взгляда при старте пропущена.",
+                COLORS["yellow"],
+            )
 
         if self.sequence_steps:
             self._start_sequence()
@@ -4240,11 +4269,20 @@ class MainWindow(QMainWindow):
             )
             self.start_btn.setEnabled(self.serial.is_open)
             return
-        if self._gaze_off and not self._ignore_gaze:
+        # Как и для одиночного запуска: проверка взгляда имеет смысл только
+        # при наличии калибровки; без неё классификация может давать ложные
+        # срабатывания и блокировать старт последовательности.
+        has_cal = self._has_calibration_data()
+        if self._gaze_off and not self._ignore_gaze and has_cal:
             self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
             self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
             self.start_btn.setEnabled(self.serial.is_open)
             return
+        if self._gaze_off and not self._ignore_gaze and not has_cal:
+            self._log(
+                "Взгляд смещён, но калибровка отсутствует — запуск без проверки взгляда.",
+                COLORS["yellow"],
+            )
         if not self._validate_lsl_recording_ready():
             self.start_btn.setEnabled(self.serial.is_open)
             return
