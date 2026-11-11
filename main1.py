@@ -15,6 +15,7 @@ import math
 import re
 import time
 import threading
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -124,6 +125,23 @@ INVERT_SENSOR_RAW = True
 DEFAULT_GAZE_DIFF_THRESHOLD = 200.0
 GAZE_CLASSIFY_HYSTERESIS = 100.0
 MIN_CALIBRATION_SEPARATION = 80.0
+
+# ── Устойчивость классификации (антидребезг) ──────────────────────────────────
+# Скользящая медиана по последним отсчётам — гасит шум АЦП и моргания.
+IR_MEDIAN_WINDOW = 5
+# Новое состояние глаза должно продержаться указанное число свежих отсчётов
+# подряд, прежде чем сменить текущее (при 10 Гц это ~200 мс задержки).
+IR_DEBOUNCE_COUNT = 3
+# Гистерезис в нормированных единицах (доля σ датчика) — используется, когда
+# калибровка сохранена вместе с нормировкой датчиков.
+GAZE_HYSTERESIS_NORM = 0.5
+# Нижняя граница нормировки: не усиливаем шумы «идеально тихого» датчика.
+MIN_SENSOR_SCALE = 30.0
+
+# ── Качество фазы калибровки ──────────────────────────────────────────────────
+CALIBRATION_MIN_SAMPLES = 3
+CALIBRATION_MAX_STD = 250.0    # σ отсчётов фазы, выше которой фаза «дрожит»
+CALIBRATION_MAX_RETRIES = 2    # сколько раз проблемная фаза повторяется
 
 # Датчик считается отключённым, если от него давно нет телеметрии (с).
 # Прошивка шлёт данные каждые 100 мс, поэтому 3 с — это ~30 пропущенных
@@ -1049,6 +1067,14 @@ class MainWindow(QMainWindow):
         self._ir_events: list[dict] = []
         self._last_ir_reflect_state = [None, None]
         self._sensor_eye_pos = ["forward", "forward"]
+        # Антидребезг: окно медианы, счётчики подтверждения состояния и
+        # последний обработанный отсчёт каждого датчика.
+        self._ir_raw_history = [
+            deque(maxlen=IR_MEDIAN_WINDOW),
+            deque(maxlen=IR_MEDIAN_WINDOW),
+        ]
+        self._sensor_eye_pending: list[tuple[str, int] | None] = [None, None]
+        self._gaze_last_seen = [0.0, 0.0]
         self._ir_table_max_rows = 100
 
         # ── IR calibration (nearest-neighbor reference points) ──────────────
@@ -1059,6 +1085,8 @@ class MainWindow(QMainWindow):
         # Продолжение, которое запускается после успешной калибровки
         # (калибровка всегда выполняется перед стартом эксперимента).
         self._calibration_after = None
+        # Повторы проблемной фазы калибровки (дрожание / мало отсчётов).
+        self._calibration_retries = 0
         # Ожидание возврата взгляда в центр после калибровки: эксперимент
         # стартует автоматически, как только оба датчика увидят центр.
         self._waiting_gaze_center = False
@@ -2361,6 +2389,11 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "gaze_detail"):
             return
         states = self._gaze_eye_states()
+        self._update_gaze_indicator_with_states(states)
+
+    def _update_gaze_indicator_with_states(self, states: list[dict]):
+        if not hasattr(self, "gaze_detail"):
+            return
         with self._ir_lock:
             sensors = [dict(s) for s in self._ir_sensors]
 
@@ -2406,8 +2439,15 @@ class MainWindow(QMainWindow):
         При наличии калибровки направление берётся из ближайшей опорной точки
         этого датчика (одномерный nearest neighbor по его raw со своей
         гистерезисной памятью). Без калибровки смещение определяется по
-        признаку «виден зрачок» (нет отражения), а направление — по общей
-        классификации взгляда, если она известна.
+        признаку «виден зрачок» (нет отражения).
+
+        Устойчивость классификации:
+          • вход — скользящая медиана последних отсчётов (не мгновенный raw);
+          • если в калибровке сохранена нормировка (σ датчика), расстояния
+            делятся на неё — датчики с разной чувствительностью сравниваются
+            одинаково, а гистерезис задаётся в долях σ;
+          • новое состояние должно продержаться IR_DEBOUNCE_COUNT свежих
+            отсчёта подряд, прежде чем сменить текущее.
 
         Глаза человека сопряжены — смотреть врозь невозможно. Поэтому после
         поканальной классификации применяется общее правило: если хотя бы
@@ -2418,7 +2458,6 @@ class MainWindow(QMainWindow):
         now = time.time()
         with self._ir_lock:
             sensors = [dict(s) for s in self._ir_sensors]
-            global_pos = self._current_gaze_pos
         cal = self.ir_calibration if isinstance(self.ir_calibration, dict) else {}
         forward_ref = cal.get("forward") if isinstance(cal.get("forward"), dict) else {}
 
@@ -2429,43 +2468,72 @@ class MainWindow(QMainWindow):
             fresh = bool(s.get("available")) and (now - last_update) <= IR_STALE_SECONDS
             if not fresh:
                 self._sensor_eye_pos[idx] = "forward"
+                self._sensor_eye_pending[idx] = None
+                self._gaze_last_seen[idx] = 0.0
                 states.append({"available": False, "deviated": False, "direction": "center"})
                 scores.append(None)
                 continue
 
-            raw_val = s.get("raw", np.nan)
+            # Классификация идёт по сглаженному значению (медиана окна),
+            # а не по мгновенному отсчёту.
+            raw_val = s.get("raw_f", s.get("raw", np.nan))
             f_ref = forward_ref.get(f"s{idx}", np.nan)
             deviated = False
             direction = "center"
             score: float | None = None
 
+            scale = self._sensor_scale(idx)
             if np.isfinite(raw_val) and isinstance(f_ref, (int, float)) and np.isfinite(f_ref):
-                candidates = {"forward": abs(float(raw_val) - float(f_ref))}
+                # Расстояния до опорных точек. Нормировка на σ датчика
+                # (если она есть в калибровке) делает датчики с разной
+                # чувствительностью сопоставимыми.
+                inv = 1.0 / max(float(scale), MIN_SENSOR_SCALE) if scale else 1.0
+                candidates = {"forward": abs(float(raw_val) - float(f_ref)) * inv}
                 for name in ("left", "right"):
                     ref = cal.get(name)
                     ref_val = ref.get(f"s{idx}", np.nan) if isinstance(ref, dict) else np.nan
                     if isinstance(ref_val, (int, float)) and np.isfinite(ref_val):
-                        candidates[name] = abs(float(raw_val) - float(ref_val))
+                        candidates[name] = abs(float(raw_val) - float(ref_val)) * inv
                 nearest = min(candidates, key=candidates.get)
                 current = self._sensor_eye_pos[idx]
+                # Гистерезис: в нормированных единицах, если есть нормировка,
+                # иначе в сырых единицах (совместимость со старыми калибровками).
+                hysteresis = GAZE_HYSTERESIS_NORM if scale else GAZE_CLASSIFY_HYSTERESIS
                 if (
                     current in candidates
                     and current != nearest
-                    and candidates[current] - candidates[nearest] < GAZE_CLASSIFY_HYSTERESIS
+                    and candidates[current] - candidates[nearest] < hysteresis
                 ):
                     nearest = current
-                self._sensor_eye_pos[idx] = nearest
-                deviated = nearest != "forward"
-                direction = nearest if deviated else "center"
+
+                # Временной дебаунс: новое состояние должно продержаться
+                # IR_DEBOUNCE_COUNT свежих отсчёта подряд, прежде чем сменить
+                # текущее. Счётчик растёт только на новых отсчётах.
+                if nearest != current:
+                    pending = self._sensor_eye_pending[idx]
+                    has_new_data = last_update != self._gaze_last_seen[idx]
+                    if has_new_data:
+                        count = pending[1] + 1 if pending and pending[0] == nearest else 1
+                        self._sensor_eye_pending[idx] = (nearest, count)
+                        if count >= IR_DEBOUNCE_COUNT:
+                            self._sensor_eye_pos[idx] = nearest
+                            self._sensor_eye_pending[idx] = None
+                else:
+                    self._sensor_eye_pending[idx] = None
+                self._gaze_last_seen[idx] = last_update
+
+                deviated = self._sensor_eye_pos[idx] != "forward"
+                direction = self._sensor_eye_pos[idx] if deviated else "center"
                 # Уверенность направления: насколько опорная точка отклонения
-                # ближе, чем «вперёд». Используется при сопряжении глаз.
+                # ближе, чем «вперёд» (в нормированных единицах).
                 if deviated:
-                    score = candidates["forward"] - candidates[nearest]
+                    score = candidates["forward"] - candidates[self._sensor_eye_pos[idx]]
             else:
                 deviated = not bool(s.get("reflect", True))
-                if deviated:
-                    direction = global_pos if global_pos in ("left", "right") else "off"
-                self._sensor_eye_pos[idx] = "forward" if not deviated else direction
+                direction = "off" if deviated else "center"
+                self._sensor_eye_pos[idx] = "forward" if not deviated else "off"
+                self._sensor_eye_pending[idx] = None
+                self._gaze_last_seen[idx] = last_update
 
             states.append(
                 {
@@ -2506,50 +2574,45 @@ class MainWindow(QMainWindow):
 
         return states
 
-    def _classify_gaze_position(self) -> str:
-        """Classify current gaze as 'forward', 'left', 'right', or 'off'.
+    def _sensor_scale(self, idx: int) -> float | None:
+        """Нормировка датчика (σ из калибровки) или None, если её нет.
 
-        Uses nearest-neighbor distance in (s0, s1) space against calibration
-        reference points, with hysteresis. Falls back to |s0-s1| threshold
-        in default mode (no calibration). Values used here are already
-        inverted (if INVERT_SENSOR_RAW is True), so all comparisons are
-        consistent.
+        Старые калибровки без нормировки работают в сырых единицах,
+        как раньше.
         """
-        with self._ir_lock:
-            s0 = dict(self._ir_sensors[0])
-            s1 = dict(self._ir_sensors[1])
-            current = self._current_gaze_pos
+        cal = self.ir_calibration if isinstance(self.ir_calibration, dict) else {}
+        scale = cal.get("scale")
+        if isinstance(scale, dict):
+            value = scale.get(f"s{idx}", np.nan)
+            if isinstance(value, (int, float)) and np.isfinite(value) and value > 0:
+                return float(value)
+        return None
 
-        if not s0["available"] or not s1["available"]:
-            return "forward"
+    def _position_from_eye_states(self, states: list[dict]) -> str:
+        """Единая классификация позиции взгляда по состояниям глаз.
 
-        r0 = s0.get("raw", np.nan)
-        r1 = s1.get("raw", np.nan)
-        if not (np.isfinite(r0) and np.isfinite(r1)):
-            return "forward"
+        Глаза сопряжены, поэтому позиция выводится из того же сопряжённого
+        результата, что и индикатор: если хоть один доступный глаз смещён —
+        берём его направление (влево/вправо), иначе «вперёд». Направление
+        «off» означает «смещено, но направление не определено».
+        """
+        for st in states:
+            if st.get("available") and st.get("deviated"):
+                direction = st.get("direction")
+                return direction if direction in ("left", "right") else "off"
+        return "forward"
 
-        cal = self.ir_calibration
-        if not cal or "forward" not in cal:
-            if abs(r0 - r1) < DEFAULT_GAZE_DIFF_THRESHOLD:
-                return "forward"
-            return "off"
-
-        dists: dict[str, float] = {}
-        for pos_name in ("forward", "left", "right"):
-            if pos_name in cal:
-                p = cal[pos_name]
-                dists[pos_name] = float(np.hypot(r0 - p["s0"], r1 - p["s1"]))
-
-        if not dists:
-            return "forward"
-
-        nearest = min(dists, key=dists.get)
-
-        if current in dists and current != nearest:
-            if dists[current] - dists[nearest] < GAZE_CLASSIFY_HYSTERESIS:
-                return current
-
-        return nearest
+    def _update_calibration_progress_status(self):
+        """Живой счётчик отсчётов текущей фазы калибровки в статус-строке."""
+        if not (0 <= self._calibration_phase < 3):
+            return
+        direction = self._calibration_instructions[self._calibration_phase][0]
+        phase = self._calibration_samples[self._calibration_phase]
+        n0, n1 = len(phase["sensor0"]), len(phase["sensor1"])
+        self.status_bar.showMessage(
+            f"Калибровка [{direction}] {self._calibration_phase + 1}/3: сбор данных…  "
+            f"отсчётов: право {n0} · лево {n1}"
+        )
 
     def _set_current_ir(self, sensor_id: int, ir_data: dict):
         sensor_id = int(sensor_id) % 2
@@ -2566,9 +2629,22 @@ class MainWindow(QMainWindow):
 
         with self._ir_lock:
             s = self._ir_sensors[sensor_id]
+            prev_update = float(s.get("last_update") or 0.0)
             s.update(ir_data)
             s["available"] = True
             s["last_update"] = now
+
+            # Скользящая медиана для классификации: гасит шум АЦП и моргания.
+            # В экспорт LSL и панель идёт сырой raw — он не меняется.
+            raw_val = s.get("raw", np.nan)
+            history = self._ir_raw_history[sensor_id]
+            if isinstance(raw_val, (int, float)) and np.isfinite(raw_val):
+                if prev_update and (now - prev_update) > IR_STALE_SECONDS:
+                    history.clear()  # датчик «пропадал» — начинаем окно заново
+                history.append(float(raw_val))
+                s["raw_f"] = float(np.median(history))
+            else:
+                s["raw_f"] = s.get("raw_f", np.nan)
 
             if self._recording_active:
                 prev = self._last_ir_reflect_state[sensor_id]
@@ -2590,10 +2666,13 @@ class MainWindow(QMainWindow):
                         del self._ir_events[:10000]
 
         if self._calibration_in_progress:
+            if self._calibration_phase_collecting:
+                self._update_calibration_progress_status()
             self._update_gaze_indicator_text()
             return
 
-        new_pos = self._classify_gaze_position()
+        states = self._gaze_eye_states()
+        new_pos = self._position_from_eye_states(states)
         old_pos = self._current_gaze_pos
         old_off = self._gaze_off
         new_off = (new_pos != "forward")
@@ -2620,7 +2699,7 @@ class MainWindow(QMainWindow):
             self._log("Взгляд в центре — запуск эксперимента.", COLORS["green"])
             QTimer.singleShot(250, self._start_experiment)
 
-        self._update_gaze_indicator_text()
+        self._update_gaze_indicator_with_states(states)
 
     def _get_current_ir(self) -> dict:
         """Aggregate snapshot for LSL recording (first available sensor) + position."""
@@ -2679,9 +2758,9 @@ class MainWindow(QMainWindow):
         if not cal or "forward" not in cal:
             mode_note = " (инвертированные показания)" if INVERT_SENSOR_RAW else ""
             self.calibration_status_label.setText(
-                "Калибровка: не выполнена. "
-                "По умолчанию взгляд вперёд, если |s0 − s1| < "
-                f"{int(DEFAULT_GAZE_DIFF_THRESHOLD)}; иначе — смещён.{mode_note}"
+                "Калибровка: не выполнена. По умолчанию смещение определяется "
+                "по видимости зрачка датчиком (нет отражения — смещён)."
+                f"{mode_note}"
             )
             return
         parts = []
@@ -2689,6 +2768,9 @@ class MainWindow(QMainWindow):
             if pos_name in cal:
                 p = cal[pos_name]
                 parts.append(f"{label} = ({p['s0']:.0f}; {p['s1']:.0f})")
+        scale = cal.get("scale")
+        if isinstance(scale, dict):
+            parts.append(f"σ: право={scale.get('s0', 0):.0f}, лево={scale.get('s1', 0):.0f}")
         self.calibration_status_label.setText("Калибровка: " + "   |   ".join(parts))
 
     def _load_calibration(self):
@@ -2712,6 +2794,20 @@ class MainWindow(QMainWindow):
                     }
                 except (KeyError, ValueError, TypeError):
                     continue
+            # Нормировка датчиков (σ) — необязательная часть; старые
+            # сохранённые калибровки её не содержат и работают в сырых единицах.
+            scale_data = data.get("scale")
+            if isinstance(scale_data, dict):
+                scale: dict = {}
+                for key in ("s0", "s1"):
+                    try:
+                        value = float(scale_data[key])
+                        if np.isfinite(value) and value > 0:
+                            scale[key] = max(value, MIN_SENSOR_SCALE)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                if scale:
+                    clean["scale"] = scale
             if "forward" not in clean:
                 self.ir_calibration = {}
             else:
@@ -2786,6 +2882,7 @@ class MainWindow(QMainWindow):
         self._calibration_in_progress = True
         self._calibration_phase = 0
         self._calibration_phase_collecting = False
+        self._calibration_retries = 0
         self._calibration_samples = [
             {"sensor0": [], "sensor1": []},
             {"sensor0": [], "sensor1": []},
@@ -2848,6 +2945,18 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"Калибровка [{direction}]: сбор данных 3 с…")
         QTimer.singleShot(3000, self._calibration_phase_done)
 
+    def _phase_stds(self, phase_idx: int) -> tuple:
+        """σ отсчётов фазы по каждому датчику (None, если отсчётов < 2)."""
+        out = []
+        for key in ("sensor0", "sensor1"):
+            raws = [
+                r["raw"]
+                for r in self._calibration_samples[phase_idx][key]
+                if np.isfinite(r["raw"])
+            ]
+            out.append(float(np.std(raws)) if len(raws) >= 2 else None)
+        return tuple(out)
+
     def _calibration_phase_done(self):
         if not self._calibration_in_progress:
             return
@@ -2861,6 +2970,40 @@ class MainWindow(QMainWindow):
             COLORS["accent"],
         )
 
+        # Качество фазы: слишком мало отсчётов или сильное дрожание взгляда
+        # — фаза повторяется (ограниченное число раз), а не проваливает
+        # всю калибровку.
+        bad_reason = None
+        if n0 < CALIBRATION_MIN_SAMPLES or n1 < CALIBRATION_MIN_SAMPLES:
+            bad_reason = f"мало отсчётов (нужно ≥{CALIBRATION_MIN_SAMPLES})"
+        else:
+            std0, std1 = self._phase_stds(self._calibration_phase)
+            for sensor_name, std in (("право", std0), ("лево", std1)):
+                if std is not None and std > CALIBRATION_MAX_STD:
+                    bad_reason = f"дрожание ({sensor_name}: σ={std:.0f})"
+                    break
+
+        if bad_reason and self._calibration_retries < CALIBRATION_MAX_RETRIES:
+            self._calibration_retries += 1
+            self._log(
+                f"Калибровка [{direction}]: {bad_reason} — повтор фазы "
+                f"({self._calibration_retries}/{CALIBRATION_MAX_RETRIES}). "
+                "Держите взгляд неподвижнее.",
+                COLORS["yellow"],
+            )
+            self.status_bar.showMessage(
+                f"Калибровка [{direction}]: {bad_reason} — повтор фазы…"
+            )
+            QTimer.singleShot(300, self._show_calibration_phase_dialog)
+            return
+        if bad_reason:
+            self._log(
+                f"Калибровка [{direction}]: {bad_reason} — повторов больше нет, "
+                "фаза принята как есть.",
+                COLORS["yellow"],
+            )
+
+        self._calibration_retries = 0
         self._calibration_phase += 1
         QTimer.singleShot(200, self._show_calibration_phase_dialog)
 
@@ -2872,7 +3015,7 @@ class MainWindow(QMainWindow):
         fwd = self._calibration_samples[1]
         right = self._calibration_samples[2]
 
-        MIN_SAMPLES = 3
+        MIN_SAMPLES = CALIBRATION_MIN_SAMPLES
 
         def median_for(phase_data, sensor_key):
             raws = [r["raw"] for r in phase_data[sensor_key] if np.isfinite(r["raw"])]
@@ -2945,7 +3088,21 @@ class MainWindow(QMainWindow):
             self._calibration_abort("точки «влево»/«вправо» слишком близки к «вперёд»")
             return
 
+        # Нормировка датчиков: σ каждого датчика (медиана по трём фазам).
+        # Классификация будет мерить отклонения в долях σ — датчики с разной
+        # чувствительностью сравниваются одинаково.
+        scale: dict = {}
+        for idx, key in ((0, "sensor0"), (1, "sensor1")):
+            stds = [self._phase_stds(i)[0 if idx == 0 else 1] for i in range(3)]
+            finite = [s for s in stds if s is not None and np.isfinite(s)]
+            if finite:
+                sigma = float(np.median(finite))
+                if np.isfinite(sigma) and sigma > 0:
+                    scale[f"s{idx}"] = max(sigma, MIN_SENSOR_SCALE)
+
         self.ir_calibration = {"left": l, "forward": f, "right": r}
+        if scale:
+            self.ir_calibration["scale"] = scale
         self._save_calibration()
         self._apply_calibration_to_firmware()
         # После калибровки отсчёт взгляда начинается заново: последняя фаза
@@ -2953,6 +3110,7 @@ class MainWindow(QMainWindow):
         self._current_gaze_pos = "forward"
         self._gaze_off = False
         self._sensor_eye_pos = ["forward", "forward"]
+        self._sensor_eye_pending = [None, None]
         self._update_calibration_status_label()
         self._update_gaze_indicator_text()
         self._set_gaze_indicator_style("forward")
@@ -2970,6 +3128,12 @@ class MainWindow(QMainWindow):
             f"   вправо: sensor0={r['s0']:.0f}, sensor1={r['s1']:.0f}",
             COLORS["text_dim"],
         )
+        if scale:
+            self._log(
+                f"   нормировка (σ): право={scale.get('s0', 0):.0f}, "
+                f"лево={scale.get('s1', 0):.0f} — пороги в долях σ",
+                COLORS["text_dim"],
+            )
         self._log(
             f"   расстояния: left↔forward={d_lf:.0f}, right↔forward={d_rf:.0f}",
             COLORS["text_dim"],
@@ -3304,10 +3468,13 @@ class MainWindow(QMainWindow):
             "ir_calibration_points_json": self._json_value(self.ir_calibration),
             "ir_invert_sensor_raw": bool(INVERT_SENSOR_RAW),
             "ir_classification_note": (
-                "ir_gaze_position is classified in Python using nearest-neighbor "
-                "in (sensor0, sensor1) raw space against ir_calibration_points_json. "
-                "'forward' means gaze OK; 'left'/'right' trigger pause. "
-                "In default mode (no calibration) classification uses |s0-s1| threshold. "
+                "ir_gaze_position is classified in Python per sensor (nearest-neighbor "
+                "against ir_calibration_points_json, distances normalized by per-sensor "
+                "sigma from 'scale' when present; sliding-median smoothed input, "
+                "state-change debounce, conjugate-gaze propagation to both eyes). "
+                "'forward' means gaze OK; 'left'/'right'/'off' trigger pause. "
+                "In default mode (no calibration) deviation uses the per-sensor "
+                "reflect flag. "
                 "Values in ir_* columns are already inverted if ir_invert_sensor_raw=True: "
                 "LOW raw = white/sclera, HIGH raw = black/pupil."
             ),
