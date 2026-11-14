@@ -2951,7 +2951,7 @@ class MainWindow(QMainWindow):
             )
             self.status_bar.showMessage("Нет подключения к Arduino для калибровки")
             return False
-        if self._running:
+        if self._running or self._paused_by_gaze:
             self._stop(reason="Калибровка")
 
         self._calibration_after = after
@@ -4067,6 +4067,12 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Подключитесь к Arduino перед стартом")
             return
 
+        # Новый эксперимент поверх паузы или ещё идущего прогона: сначала
+        # корректно завершаем предыдущий (STOP, экспорт записи, сброс
+        # состояния) — иначе его пауза/запись «протекают» в новый.
+        if self._running or self._paused_by_gaze:
+            self._stop(reason="Запуск нового эксперимента")
+
         self.start_btn.setEnabled(False)
         # «Пропустить калибровку» (флажок в «Сервисе»): стартуем сразу.
         # Классификация взгляда работает по сохранённой калибровке, а если её
@@ -4083,11 +4089,28 @@ class MainWindow(QMainWindow):
         if not self._start_calibration(after=self._start_experiment):
             self.start_btn.setEnabled(self.serial.is_open)
 
+    def _reset_gaze_pause_state(self):
+        """Новый эксперимент не наследует паузу по взгляду от прошлого.
+
+        Если эксперимент остался на паузе (пользователь нажал «Старт», а не
+        «Стоп»), флаг ``_paused_by_gaze`` переживает калибровку и запуск —
+        и тогда уровневая логика в ``_set_current_ir`` навсегда остаётся в
+        ветке «пауза уже стоит»: взгляд виден (индикатор показывает «влево»),
+        но эксперимент не останавливается.
+        """
+        self._paused_by_gaze = False
+        self._resuming_after_gaze_pause = False
+        self._pause_step_index = -1
+        self._pause_remaining_seconds = 0.0
+        self._sequence_override_seconds = None
+
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда."""
         # Одноразовый обход проверки взгляда (повторное нажатие «Старт»).
         force_gaze = self._start_now_once
         self._start_now_once = False
+        # Чистый старт: никакой паузы/остатков от предыдущего эксперимента.
+        self._reset_gaze_pause_state()
         if self._gaze_off and not self._ignore_gaze() and not force_gaze:
             # Последняя фаза калибровки — «ВПРАВО»: взгляд ещё не успел
             # вернуться в центр. Не считаем это ошибкой — ждём возврата
