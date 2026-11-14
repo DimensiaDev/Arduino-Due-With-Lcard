@@ -140,11 +140,19 @@ IR_DEBOUNCE_COUNT = 3
 MIN_SENSOR_SCALE = 30.0
 
 # ── Качество фазы калибровки ──────────────────────────────────────────────────
-CALIBRATION_MIN_SAMPLES = 8    # после отбрасывания первых 0.5 с фазы
+CALIBRATION_MIN_SAMPLES = 8    # после отбрасывания первых CALIBRATION_SETTLE_SECONDS с фазы
 CALIBRATION_MAX_STD = 250.0    # σ (устойчивая, MAD) фазы, выше — «дрожит»
 CALIBRATION_MAX_RETRIES = 2    # сколько раз проблемная фаза повторяется
-# Первые 0.5 с фазы не собираем: взгляд ещё перемещается к цели.
-CALIBRATION_SETTLE_SECONDS = 0.5
+# Первые CALIBRATION_SETTLE_SECONDS с фазы не собираем: взгляд ещё
+# перемещается к цели. Перевод взгляда занимает ~0,3–0,5 с, плюс время на
+# реакцию пользователя — 0,5 с мало: в опорную точку попадали «хвосты» перехода.
+CALIBRATION_SETTLE_SECONDS = 1.0
+# Допуск, насколько опорная точка «вперёд» может отличаться от середины
+# между «влево» и «вправо» (в долях расстояния left↔right).
+CALIBRATION_FORWARD_TOLERANCE = 0.3
+# Насколько далеко от опорной точки «вперёд» (в σ датчика) взгляд считается
+# смещённым, когда по калибровке сторону различить нельзя.
+GAZE_FALLBACK_SIGMA = 3.0
 
 # Датчик считается отключённым, если от него давно нет телеметрии (с).
 # Прошивка шлёт данные каждые 100 мс, поэтому 3 с — это ~30 пропущенных
@@ -688,6 +696,10 @@ class LSLRecordingWorker(threading.Thread):
                         "ir_max": ir.get("max", np.nan),
                         "ir_available": bool(ir.get("available", False)),
                         "ir_gaze_position": ir.get("gaze_position", "forward"),
+                        "ir_raw0": ir.get("raw0", np.nan),
+                        "ir_raw1": ir.get("raw1", np.nan),
+                        "ir_eye0": ir.get("eye0", "forward"),
+                        "ir_eye1": ir.get("eye1", "forward"),
                     }
                 )
 
@@ -2719,12 +2731,10 @@ class MainWindow(QMainWindow):
                 )
                 if target is None:
                     # Ни одна сторона этим датчиком не различается —
-                    # деградируем к признаку «виден зрачок».
-                    deviated_reflect = not bool(s.get("reflect", True))
-                    target = "off" if deviated_reflect else "forward"
+                    # деградируем к отклонению от точки «вперёд».
+                    target = self._fallback_eye_target(idx, float(raw_val), s)
             else:
-                deviated_reflect = not bool(s.get("reflect", True))
-                target = "off" if deviated_reflect else "forward"
+                target = self._fallback_eye_target(idx, float(raw_val), s)
 
             # Временной дебаунс: новое состояние должно продержаться
             # IR_DEBOUNCE_COUNT свежих отсчёта подряд, прежде чем сменить
@@ -2818,6 +2828,35 @@ class MainWindow(QMainWindow):
         if current in scores and scores[current] >= GAZE_PROJECTION_OFF:
             return current
         return "forward"
+
+    def _fallback_eye_target(self, idx: int, raw_val: float, s: dict) -> str:
+        """Оценка положения глаза, когда по калибровке сторону не различить.
+
+        Считаем отклонение от опорной точки «вперёд» в σ датчика: ушли
+        дальше GAZE_FALLBACK_SIGMA·σ — взгляд смещён (направление при этом
+        неизвестно, поэтому «off»), иначе «вперёд».
+
+        Признак «виден зрачок» от прошивки используется только когда
+        калибровки нет вовсе: этот признак зависит от порога, который сама
+        прошивка получила из калибровки, и от неизвестной нам конвенции
+        «белок = низкий raw» — опереться на него нельзя.
+        """
+        cal = self.ir_calibration if isinstance(self.ir_calibration, dict) else {}
+        f_ref = np.nan
+        ref = cal.get("forward")
+        if isinstance(ref, dict):
+            value = ref.get(f"s{idx}", np.nan)
+            if isinstance(value, (int, float)) and np.isfinite(value):
+                f_ref = float(value)
+
+        if np.isfinite(raw_val) and np.isfinite(f_ref):
+            sigma = max(self._sensor_scale(idx) or MIN_SENSOR_SCALE, MIN_SENSOR_SCALE)
+            if abs(raw_val - f_ref) > GAZE_FALLBACK_SIGMA * sigma:
+                return "off"
+            return "forward"
+
+        # Калибровки нет — остаётся признак «зрачок/белок» от прошивки.
+        return "forward" if bool(s.get("reflect", True)) else "off"
 
     def _sensor_scale(self, idx: int) -> float | None:
         """Нормировка датчика (σ из калибровки) или None, если её нет.
@@ -2988,6 +3027,14 @@ class MainWindow(QMainWindow):
                     }
                     break
             info["gaze_position"] = self._current_gaze_pos
+            # Оба датчика по отдельности: по экспорту можно офлайн проверить
+            # и при необходимости пересчитать классификацию взгляда.
+            for idx, s in enumerate(self._ir_sensors):
+                info[f"raw{idx}"] = s.get("raw", np.nan)
+                info[f"volts{idx}"] = s.get("volts", np.nan)
+                info[f"reflect{idx}"] = bool(s.get("reflect", True))
+                info[f"available{idx}"] = bool(s.get("available", False))
+                info[f"eye{idx}"] = self._sensor_eye_pos[idx]
             return info
 
     def _append_ir_table_row(self, sensor_id: int, raw, volts, refl, mn, mx):
@@ -3406,17 +3453,96 @@ class MainWindow(QMainWindow):
                 COLORS["yellow"],
             )
 
+        # ── Проверки геометрии калибровки ────────────────────────────────────
+        # Ошибка здесь не ломает эксперимент мгновенно, но искажает
+        # классификацию взгляда, а значит — моменты пауз и всю разметку
+        # эксперимента. Поэтому предупреждаем явно.
+        geometry_problems: list[str] = []
+
+        # 1. Опорная точка «вперёд» должна лежать между «влево» и «вправо»,
+        #    причём примерно посередине: взгляд «вперёд» — это середина дуги
+        #    между крайними положениями. Смещение говорит о том, что в фазе
+        #    «вперёд» пользователь смотрел не в центр.
+        mid_s0 = (float(l["s0"]) + float(r["s0"])) / 2.0
+        mid_s1 = (float(l["s1"]) + float(r["s1"])) / 2.0
+        lr_span = float(
+            np.hypot(float(l["s0"]) - float(r["s0"]),
+                     float(l["s1"]) - float(r["s1"]))
+        )
+        if lr_span > 0.0:
+            offset = float(
+                np.hypot(float(f["s0"]) - mid_s0, float(f["s1"]) - mid_s1)
+            )
+            if offset > CALIBRATION_FORWARD_TOLERANCE * lr_span:
+                geometry_problems.append(
+                    f"«вперёд» смещён от середины «влево»↔«вправо» "
+                    f"({offset:.0f} из {lr_span:.0f})"
+                )
+        for idx in (0, 1):
+            key = f"s{idx}"
+            lo = min(float(l[key]), float(r[key]))
+            hi = max(float(l[key]), float(r[key]))
+            span = hi - lo
+            if span <= 0.0:
+                continue
+            f_val = float(f[key])
+            tol = 0.15 * span
+            if not (lo - tol <= f_val <= hi + tol):
+                geometry_problems.append(
+                    f"датчик {idx}: «вперёд»={f_val:.0f} вне диапазона "
+                    f"[{lo:.0f}…{hi:.0f}]"
+                )
+
+        # 2. Датчики должны реагировать навстречу друг другу: зрачок уходит
+        #    к одному глазу и открывает другой. Оба датчика в одну сторону —
+        #    признак перекрытого или «сбитого» датчика.
+        sig0 = max(float(scale.get("s0", MIN_SENSOR_SCALE)), MIN_SENSOR_SCALE)
+        sig1 = max(float(scale.get("s1", MIN_SENSOR_SCALE)), MIN_SENSOR_SCALE)
+        for side_name, side in (("влево", l), ("вправо", r)):
+            d0 = float(side["s0"]) - float(f["s0"])
+            d1 = float(side["s1"]) - float(f["s1"])
+            if abs(d0) > 2.0 * sig0 and abs(d1) > 2.0 * sig1 and (d0 > 0) == (d1 > 0):
+                geometry_problems.append(
+                    f"«{side_name}»: датчики сместились синхронно "
+                    f"(Δ0={d0:+.0f}, Δ1={d1:+.0f})"
+                )
+
+        # 3. Фазы «влево» и «вправо» должны различаться, иначе направление
+        #    взгляда определить не по чему.
+        if d_lr < MIN_CALIBRATION_SEPARATION:
+            geometry_problems.append(
+                f"«влево» и «вправо» почти неразличимы (d={d_lr:.0f})"
+            )
+
+        if geometry_problems:
+            self._log(
+                "Калибровка: проверка геометрии — " + "; ".join(geometry_problems),
+                COLORS["yellow"],
+            )
+            self._log(
+                "   Если направление взгляда отслеживается неверно — "
+                "переделайте калибровку.",
+                COLORS["yellow"],
+            )
+
         self.ir_calibration = {"left": l, "forward": f, "right": r}
         if scale:
             self.ir_calibration["scale"] = scale
         self._save_calibration()
         self._apply_calibration_to_firmware()
-        # После калибровки отсчёт взгляда начинается заново: последняя фаза
-        # была «ВПРАВО», поэтому без сброса старт считался бы смещённым.
-        self._current_gaze_pos = "forward"
-        self._gaze_off = False
+        # После калибровки накопленное состояние сбрасываем: последняя фаза
+        # была «ВПРАВО», а в окне медианы и в счётчиках дебаунса ещё лежат
+        # отсчёты старого положения. Реальную позицию определит свежая
+        # телеметрия — иначе приложение считало бы взгляд «вперёд», хотя
+        # пользователь смотрит в сторону: эксперимент стартовал бы с
+        # отведённым взглядом и тут же вставал бы на паузу.
+        with self._ir_lock:
+            for history in self._ir_raw_history:
+                history.clear()
         self._sensor_eye_pos = ["forward", "forward"]
         self._sensor_eye_pending = [None, None]
+        self._current_gaze_pos = "forward"
+        self._gaze_off = False
         self._update_calibration_status_label()
         self._update_gaze_indicator_text()
         self._set_gaze_indicator_style("forward")
@@ -3449,9 +3575,12 @@ class MainWindow(QMainWindow):
         self._calibration_after = None
         if after is not None:
             self.status_bar.showMessage("Калибровка завершена — запуск эксперимента")
-            # Небольшая пауза, чтобы пришли свежие отсчёты датчиков и
-            # классификация взгляда обновилась по новой калибровке.
-            QTimer.singleShot(400, after)
+            # Пауза, чтобы пришли свежие отсчёты датчиков и классификация
+            # взгляда обновилась по новой калибровке: дебаунс — 3 свежих
+            # отсчёта (≈300 мс при 10 Гц), плюс время на сам отсчёт. За
+            # эти 700 мс приложение уже понимает, куда смотрит человек, и
+            # стартует только если взгляд действительно в центре.
+            QTimer.singleShot(700, after)
         else:
             self.status_bar.showMessage("Калибровка завершена")
 
@@ -3802,6 +3931,12 @@ class MainWindow(QMainWindow):
             "ir_max": [r.get("ir_max", np.nan) for r in records],
             "ir_available": [1 if r.get("ir_available") else 0 for r in records],
             "ir_gaze_position": [r.get("ir_gaze_position", "forward") for r in records],
+            # Оба датчика по отдельности — чтобы классификацию взгляда можно
+            # было проверить и пересчитать офлайн по сырым отсчётам.
+            "ir_raw0": [r.get("ir_raw0", np.nan) for r in records],
+            "ir_raw1": [r.get("ir_raw1", np.nan) for r in records],
+            "ir_eye0": [r.get("ir_eye0", "forward") for r in records],
+            "ir_eye1": [r.get("ir_eye1", "forward") for r in records],
         }
         for idx, name in enumerate(safe_names):
             data[f"raw_{name}"] = raw[:, idx]
