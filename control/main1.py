@@ -1677,24 +1677,57 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(16)
         grid.setVerticalSpacing(8)
 
-        metrics = (
-            ("Состояние", self.ir_state),
-            ("RAW (0…4095)", self.ir_raw),
-            ("Напряжение, В", self.ir_volts),
-            ("Мин / Макс за 100 мс", self.ir_span),
-            ("Порог срабатывания", self.ir_th),
+        # Панель по-датчиковая: пакеты от сенсоров 0 и 1 чередуются, поэтому
+        # общие поля «мигали» между двумя глазами и не соответствовали
+        # индикатору направления. Теперь у каждого датчика своя колонка.
+        grid.addWidget(QLabel(""), 0, 0)
+        for col, header_text in ((1, "Датчик 0 — ПРАВО"), (2, "Датчик 1 — ЛЕВО")):
+            header = QLabel(header_text)
+            header.setObjectName("metric_label")
+            grid.addWidget(header, 0, col)
+
+        self.ir_metrics: dict[int, dict[str, QLabel]] = {0: {}, 1: {}}
+        metric_rows = (
+            ("raw", "RAW (0…4095)"),
+            ("volts", "Напряжение, В"),
+            ("span", "Мин / Макс за 100 мс"),
+            ("th", "Порог срабатывания"),
+            ("state", "Состояние"),
+            ("dir", "Направление (датчик)"),
         )
-        for idx, (label, value) in enumerate(metrics):
-            row = idx // 3
-            col = (idx % 3) * 2
-            caption = QLabel(label)
-            caption.setObjectName("metric_label")
-            value.setObjectName("metric_value")
-            grid.addWidget(caption, row, col)
-            grid.addWidget(value, row, col + 1)
-            grid.setColumnStretch(col + 1, 1)
+        for row, (key, caption) in enumerate(metric_rows, start=1):
+            caption_label = QLabel(caption)
+            caption_label.setObjectName("metric_label")
+            grid.addWidget(caption_label, row, 0)
+            for col, sensor_id in ((1, 0), (2, 1)):
+                value = QLabel("—")
+                value.setObjectName("metric_value")
+                grid.addWidget(value, row, col)
+                grid.setColumnStretch(col, 1)
+                self.ir_metrics[sensor_id][key] = value
 
         layout.addLayout(grid)
+
+        # Общая классификация — ровно то же, что показывает главный экран.
+        gaze_row = QHBoxLayout()
+        gaze_row.setSpacing(8)
+        gaze_caption = QLabel("Направление взгляда (общее):")
+        gaze_caption.setObjectName("metric_label")
+        gaze_row.addWidget(gaze_caption)
+        self.ir_gaze_dir = QLabel("—")
+        self.ir_gaze_dir.setObjectName("status_value")
+        gaze_row.addWidget(self.ir_gaze_dir)
+        gaze_row.addStretch()
+        layout.addLayout(gaze_row)
+
+        if INVERT_SENSOR_RAW:
+            inv_hint = QLabel(
+                "Показания приведены к шкале «меньше = белок (взгляд в норме), "
+                "больше = зрачок»."
+            )
+            inv_hint.setObjectName("hint_label")
+            inv_hint.setWordWrap(True)
+            layout.addWidget(inv_hint)
 
         calib_label = QLabel("Калибровка положения взгляда")
         calib_label.setObjectName("section_label")
@@ -2511,6 +2544,34 @@ class MainWindow(QMainWindow):
             self.gaze_detail.setText(html)
         if hasattr(self, "gaze_eyes"):
             self.gaze_eyes.set_eyes(states)
+
+        # Вкладка «Сервис»: та же классификация, что на главном экране —
+        # поканально (по каждому датчику) и общая позиция.
+        if hasattr(self, "ir_metrics"):
+            dir_text = {
+                "forward": "вперёд",
+                "left": "влево",
+                "right": "вправо",
+                "off": "в сторону",
+            }
+            for i in (0, 1):
+                direction = self._sensor_eye_pos[i]
+                color = COLORS["green"] if direction == "forward" else COLORS["red"]
+                label = self.ir_metrics[i]["dir"]
+                label.setText(dir_text.get(direction, direction))
+                label.setStyleSheet(
+                    f"color:{color};font-family:'JetBrains Mono';font-size:11px;"
+                    f"font-weight:600;"
+                )
+        if hasattr(self, "ir_gaze_dir"):
+            pos_color = (
+                COLORS["green"] if self._current_gaze_pos == "forward" else COLORS["red"]
+            )
+            self.ir_gaze_dir.setText(gaze_position_label(self._current_gaze_pos))
+            self.ir_gaze_dir.setStyleSheet(
+                f"color:{pos_color};font-family:'JetBrains Mono';font-size:12px;"
+                f"font-weight:600;"
+            )
 
     def _gaze_eye_states(self) -> list[dict]:
         """Состояние каждого «глаза» (датчика) для индикатора взгляда.
@@ -3844,15 +3905,18 @@ class MainWindow(QMainWindow):
             min_display = int(round(min_val)) if np.isfinite(min_val) else "?"
             max_display = int(round(max_val)) if np.isfinite(max_val) else "?"
 
-            self.ir_raw.setText(str(raw_display))
-            self.ir_volts.setText(f"{volts:.3f}")
-            self.ir_span.setText(f"{min_display} / {max_display}")
-            self.ir_th.setText(str(th_display))
-            self.ir_state.setText(state)
-            self.ir_state.setStyleSheet(
-                f"color:{COLORS['green'] if refl else COLORS['red']};"
-                f"font-family:'JetBrains Mono';font-size:11px;font-weight:600;"
-            )
+            # Панель «Сервис»: обновляем колонку ТОЛЬКО этого датчика.
+            labels = self.ir_metrics.get(sensor_id, {})
+            if labels:
+                labels["raw"].setText(str(raw_display))
+                labels["volts"].setText(f"{volts:.3f}")
+                labels["span"].setText(f"{min_display} / {max_display}")
+                labels["th"].setText(str(th_display))
+                labels["state"].setText(state)
+                labels["state"].setStyleSheet(
+                    f"color:{COLORS['green'] if refl else COLORS['red']};"
+                    f"font-family:'JetBrains Mono';font-size:11px;font-weight:600;"
+                )
 
             try:
                 self._set_current_ir(
