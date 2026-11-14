@@ -3428,20 +3428,36 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"⏸ Пауза: {reason}")
 
         if self._running and self.sequence_steps:
+            last_idx = len(self.sequence_steps) - 1
             if self._sequence_stage_start_time is not None:
                 elapsed = time.monotonic() - self._sequence_stage_start_time
                 self._pause_remaining_seconds = max(
                     0.0, self._sequence_stage_duration - elapsed
                 )
-                self._pause_step_index = self._sequence_stage_number - 1
+                self._pause_step_index = min(
+                    self._sequence_stage_number - 1, last_idx
+                )
                 self._log(
                     f"   этап {self._sequence_stage_number} приостановлен, "
                     f"осталось {self._pause_remaining_seconds:.2f} с",
                     COLORS["yellow"],
                 )
             else:
-                self._pause_remaining_seconds = 0.0
-                self._pause_step_index = -1
+                # Нет данных о начале этапа (гонка на границе этапов):
+                # не теряем этап — продолжаем текущий/последний с его
+                # длительностью. Иначе на возобновлении можно было получить
+                # «индекс за последним этапом» и досрочное завершение.
+                idx = min(max(self._sequence_index - 1, 0), last_idx)
+                self._pause_step_index = idx
+                self._pause_remaining_seconds = float(
+                    self._sequence_stage_duration
+                    or self.sequence_steps[idx].seconds
+                )
+                self._log(
+                    f"   этап {idx + 1} будет повторён с начала "
+                    f"({self._pause_remaining_seconds:.2f} с)",
+                    COLORS["yellow"],
+                )
 
         self._sequence_stage_deadline = None
         self._sequence_timer.stop()
@@ -3474,19 +3490,32 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("▶ Возобновление")
 
         if self.sequence_steps:
+            last_idx = len(self.sequence_steps) - 1
             if self._pause_step_index >= 0:
                 # Продолжаем именно приостановленный этап с его остатком;
                 # индекс всегда в допустимых пределах — иначе «завершение
                 # эксперимента» случилось бы раньше последнего этапа.
-                self._sequence_index = min(
-                    self._pause_step_index, len(self.sequence_steps) - 1
+                self._sequence_index = min(self._pause_step_index, last_idx)
+                self._sequence_override_seconds = max(
+                    self._pause_remaining_seconds, 0.01
                 )
-                self._sequence_override_seconds = self._pause_remaining_seconds
                 self._log(
                     f"   продолжаем этап {self._sequence_index + 1}/"
                     f"{len(self.sequence_steps)} с остатком "
-                    f"{self._pause_remaining_seconds:.2f} с",
+                    f"{self._sequence_override_seconds:.2f} с",
                     COLORS["accent"],
+                )
+            else:
+                # Страховка: возобновление НИКОГДА не должно завершать
+                # эксперимент. Если индекс ушёл за последний этап или этап
+                # неизвестен — повторяем текущий/последний этап целиком.
+                idx = min(max(self._sequence_index, 0), last_idx)
+                self._sequence_index = idx
+                self._sequence_override_seconds = float(self.sequence_steps[idx].seconds)
+                self._log(
+                    f"   продолжаем этап {idx + 1}/{len(self.sequence_steps)} "
+                    "с начала (этап паузы не был записан).",
+                    COLORS["yellow"],
                 )
             self._run_next_sequence_step()
         else:
