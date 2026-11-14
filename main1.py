@@ -468,28 +468,64 @@ class SerialWorker(QObject):
                 self._port.close()
         self.connected.emit(False)
 
-    def send(self, cmd: str) -> str | None:
+    def send(self, cmd: str, timeout: float = 0.3) -> str | None:
+        """Отправляет команду и возвращает строку-ответ прошивки.
+
+        Ответом считаются только строки ``OK …``/``ERR …``. Телеметрия
+        ``{"dbg":…}``, ``{"ir":…}`` и её «хвосты» после частичного чтения НЕ
+        являются ответом — иначе команда «START» ложно считается
+        неподтверждённой и эксперимент прерывается.
+        """
         with self._lock:
             if not self._port or not self._port.is_open:
                 return None
             try:
                 self._port.reset_input_buffer()
                 self._port.write((cmd.strip() + "\n").encode())
-                deadline = time.time() + 0.3
+                deadline = time.time() + timeout
                 while time.time() < deadline:
                     line = self._port.readline().decode(errors="replace").strip()
                     if not line:
                         continue
-                    # Телеметрия прошивки ({"dbg":…}, {"ir":…}, {"status":…})
-                    # идёт каждые 100 мс и может прийти раньше ответа на
-                    # команду. Это НЕ ответ — показываем её в журнале и ждём
-                    # дальше, иначе команда «START» ложно считается
-                    # неподтверждённой и эксперимент прерывается.
-                    if line.startswith("{"):
-                        self.message_received.emit(f"← {line}")
-                        continue
                     self.message_received.emit(f"← {line}")
-                    return line
+                    if line.startswith("OK") or line.startswith("ERR"):
+                        return line
+                    # Телеметрия (или её остаток после частичного чтения) —
+                    # показываем в журнале и продолжаем ждать ответ.
+                    continue
+                return None
+            except Exception as e:
+                self.error_occurred.emit(str(e))
+                return None
+
+    def status(self, timeout: float = 0.6) -> dict | None:
+        """Спрашивает у прошивки состояние (STATUS) и возвращает JSON.
+
+        Ответ может прийти обрезанным (порт отдаёт построчно), поэтому
+        строки склеиваются до успешного разбора JSON.
+        """
+        with self._lock:
+            if not self._port or not self._port.is_open:
+                return None
+            try:
+                self._port.reset_input_buffer()
+                self._port.write(b"STATUS\n")
+                deadline = time.time() + timeout
+                buf = ""
+                while time.time() < deadline:
+                    chunk = self._port.readline().decode(errors="replace")
+                    if not chunk:
+                        continue
+                    self.message_received.emit(f"← {chunk.strip()}")
+                    if '"status"' not in chunk:
+                        continue
+                    buf += chunk
+                    try:
+                        data = json.loads(buf.strip())
+                    except Exception:
+                        continue  # строка обрезана — ждём остаток
+                    if isinstance(data, dict):
+                        return data
                 return None
             except Exception as e:
                 self.error_occurred.emit(str(e))
@@ -1095,6 +1131,9 @@ class MainWindow(QMainWindow):
 
         # ── Pause-by-gaze state ─────────────────────────────────────────────
         self._paused_by_gaze = False
+        # Эксперимент уже дошёл до конца: возобновление по взгляду не должно
+        # перезапускать его (иначе приложение снова просит сохранить результаты).
+        self._experiment_finished = False
         self._gaze_off = False
         self._current_gaze_pos = "forward"
         self._pause_step_index = -1
@@ -3420,6 +3459,12 @@ class MainWindow(QMainWindow):
     def _pause_experiment(self, reason: str = "пауза"):
         if self._paused_by_gaze:
             return
+        if not self._running:
+            # Эксперимент уже остановлен (или завершён) — пауза по взгляду
+            # не должна его трогать. Иначе возобновление по возврату взгляда
+            # перезапустило бы уже законченный прогон, и приложение снова
+            # просило бы сохранить результаты вместо спокойного завершения.
+            return
 
         self._paused_by_gaze = True
         self._resuming_after_gaze_pause = False
@@ -3469,6 +3514,15 @@ class MainWindow(QMainWindow):
 
     def _resume_experiment(self):
         if not self._paused_by_gaze:
+            return
+        if self._experiment_finished:
+            # Эксперимент уже завершён — «возобновление» означало бы его
+            # повторный запуск и ещё одно окно сохранения результатов.
+            self._paused_by_gaze = False
+            self._log(
+                "Эксперимент уже завершён — повторный запуск не выполняется.",
+                COLORS["yellow"],
+            )
             return
         self._paused_by_gaze = False
         self._running = True
@@ -4316,10 +4370,25 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Подключитесь к Arduino перед стартом")
             return
 
-        # Новый эксперимент поверх паузы или ещё идущего прогона: сначала
+        # Эксперимент стоит на паузе из-за отведения взгляда: «Старт» должен
+        # ПРОДОЛЖИТЬ его, а не прерывать с окном сохранения результатов.
+        if self._paused_by_gaze and not self._experiment_finished:
+            if self._gaze_off and not self._ignore_gaze():
+                self._log(
+                    "Эксперимент на паузе: дождитесь возврата взгляда в центр "
+                    "— продолжение произойдёт автоматически.",
+                    COLORS["yellow"],
+                )
+                self.status_bar.showMessage("Верните взгляд в центр — продолжение")
+            else:
+                self._log("Продолжаем эксперимент с паузы.", COLORS["green"])
+                self._resume_experiment()
+            return
+
+        # Новый эксперимент поверх ещё идущего прогона: сначала
         # корректно завершаем предыдущий (STOP, экспорт записи, сброс
         # состояния) — иначе его пауза/запись «протекают» в новый.
-        if self._running or self._paused_by_gaze:
+        if self._running:
             self._stop(reason="Запуск нового эксперимента")
 
         self.start_btn.setEnabled(False)
@@ -4354,6 +4423,7 @@ class MainWindow(QMainWindow):
         self._sequence_override_seconds = None
         self._pause_started_at = None
         self._sequence_stage_deadline = None
+        self._experiment_finished = False
 
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда."""
@@ -4395,13 +4465,7 @@ class MainWindow(QMainWindow):
             return
         time.sleep(0.05)
         self._log("→ START", COLORS["green"])
-        # До двух попыток: ответ может потеряться в потоке телеметрии.
-        resp = None
-        for _attempt in range(2):
-            resp = self._send("START")
-            if resp and "OK" in resp:
-                break
-        if resp and "OK" in resp:
+        if self._start_generation():
             p = self._get_params()
             if not self._begin_lsl_recording(
                 step_index=0,
@@ -4421,6 +4485,43 @@ class MainWindow(QMainWindow):
             self._send("DBG ON")
         else:
             self.start_btn.setEnabled(self.serial.is_open)
+
+    def _start_generation(self) -> bool:
+        """Отправляет START и убеждается, что генерация действительно идёт.
+
+        Ответ прошивки может потеряться или затеряться в потоке телеметрии.
+        Это не повод прерывать эксперимент: если подтверждения нет, мы
+        спрашиваем у прошивки STATUS и проверяем признак «run».
+        """
+        for attempt in range(3):
+            resp = self._send("START")
+            if resp and resp.startswith("OK"):
+                return True
+            if attempt < 2:
+                time.sleep(0.05)
+        running = self._firmware_running()
+        if running is True:
+            self._log(
+                "Ответ на START не получен, но генерация запущена "
+                "(проверено по STATUS).",
+                COLORS["yellow"],
+            )
+            return True
+        self._log(
+            "Не удалось подтвердить запуск генерации (нет ответа на START).",
+            COLORS["red"],
+        )
+        return False
+
+    def _firmware_running(self) -> bool | None:
+        """Спрашивает у прошивки, идёт ли генерация. None — связи нет."""
+        data = self.serial.status()
+        if not data:
+            return None
+        run = data.get("run")
+        if run is None:
+            return None
+        return bool(run)
 
     def _start_sequence(self, force_gaze: bool = False):
         if not self.serial.is_open or not self.sequence_steps:
@@ -4448,6 +4549,7 @@ class MainWindow(QMainWindow):
         self._resuming_after_gaze_pause = False
         self._pause_started_at = None
         self._sequence_stage_deadline = None
+        self._experiment_finished = False
         self._reset_sequence_progress(self._sequence_total_seconds())
         self._running = True
         self.start_btn.setEnabled(False)
@@ -4519,13 +4621,10 @@ class MainWindow(QMainWindow):
             self._log("→ START", COLORS["green"])
             # Ответ на START мог потеряться в потоке телеметрии — пробуем
             # ещё раз, прежде чем прерывать эксперимент. Повторный START
-            # безопасен: прошивка просто перезапустит генерацию.
-            resp = None
-            for _attempt in range(2):
-                resp = self._send("START")
-                if resp and "OK" in resp:
-                    break
-            if not resp or "OK" not in resp:
+            # безопасен: прошивка просто перезапустит генерацию. Если ответ
+            # не пришёл совсем, проверяем у прошивки признак «run» — сам
+            # по себе потерянный ответ не повод ронять эксперимент.
+            if not self._start_generation():
                 self._abort_sequence("команда START не подтверждена")
                 return
             if not self._recording_active:
@@ -4567,12 +4666,19 @@ class MainWindow(QMainWindow):
         self._sequence_timer.start(max(1, int(effective_seconds * 1000)))
 
     def _finish_sequence(self):
+        # Эксперимент завершён: помечаем ДО остановки, потому что остановка
+        # открывает модальное окно сохранения, в котором крутится цикл
+        # событий — логика взгляда не должна успеть «возобновить» прогон.
+        self._experiment_finished = True
         self._log("Последовательность завершена.", COLORS["green"])
         self._stop()
         self._finish_sequence_progress()
         self.status_bar.showMessage("Последовательность завершена")
 
     def _abort_sequence(self, reason: str):
+        # Эксперимент прерван: снимаем «идёт» до модального окна экспорта,
+        # чтобы логика взгляда не перезапустила прерванный прогон.
+        self._running = False
         self._log(f"Последовательность прервана: {reason}.", COLORS["red"])
         self._sequence_timer.stop()
         self._stop_sequence_progress()
@@ -4597,6 +4703,12 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"Последовательность прервана: {reason}")
 
     def _stop(self, checked=False, export: bool = True, reason: str = "Остановлено"):
+        # Прогон считается остановленным СРАЗУ, до модального окна
+        # сохранения: окно живёт в отдельном цикле событий, и пока флаг
+        # «идёт» стоял, логика взгляда успевала поставить паузу и затем
+        # возобновить уже завершённый эксперимент — приложение снова и
+        # снова просило сохранить результаты вместо завершения.
+        self._running = False
         try:
             self._sequence_timer.stop()
             self._auto_apply_timer.stop()
