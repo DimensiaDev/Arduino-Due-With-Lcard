@@ -1427,10 +1427,63 @@ class MainWindow(QMainWindow):
         v.addWidget(self._build_debug_stats_panel())
         v.addWidget(self._build_ir_panel())
 
+        gaze_box, gaze_layout = self._make_subcard("Взгляд", COLORS["accent2"])
+        self.ignore_gaze_check = QCheckBox("Игнорировать направление взгляда")
+        self.ignore_gaze_check.setToolTip(
+            "Отклонение взгляда не ставит эксперимент на паузу и не блокирует Старт.\n"
+            "Индикатор глаз продолжает показывать реальное состояние датчиков."
+        )
+        gaze_layout.addWidget(self.ignore_gaze_check)
+
+        self.skip_calibration_check = QCheckBox("Пропустить калибровку")
+        self.skip_calibration_check.setToolTip(
+            "«Старт» сразу запускает эксперимент без калибровки взгляда.\n"
+            "Классификация использует сохранённую калибровку, а если её нет — "
+            "пороги по умолчанию (порог АЦП прошивки и признак «виден зрачок»)."
+        )
+        gaze_layout.addWidget(self.skip_calibration_check)
+
+        # Состояние флажков переживает перезапуск приложения.
+        self.ignore_gaze_check.setChecked(
+            bool(self.settings.value("service/ignore_gaze", False, type=bool))
+        )
+        self.skip_calibration_check.setChecked(
+            bool(self.settings.value("service/skip_calibration", False, type=bool))
+        )
+        self.ignore_gaze_check.toggled.connect(self._on_ignore_gaze_toggled)
+        self.skip_calibration_check.toggled.connect(self._on_skip_calibration_toggled)
+        v.addWidget(gaze_box)
+
         console_box, console_layout = self._make_subcard("Журнал", COLORS["accent"])
         console_layout.addWidget(self.console, 1)
         v.addWidget(console_box, 1)
         return w
+
+    def _ignore_gaze(self) -> bool:
+        return hasattr(self, "ignore_gaze_check") and self.ignore_gaze_check.isChecked()
+
+    def _skip_calibration(self) -> bool:
+        return (
+            hasattr(self, "skip_calibration_check")
+            and self.skip_calibration_check.isChecked()
+        )
+
+    def _on_ignore_gaze_toggled(self, checked: bool):
+        self.settings.setValue("service/ignore_gaze", bool(checked))
+        # Если эксперимент уже стоит на паузе по взгляду — снимаем её сразу:
+        # раз взгляд игнорируется, ждать возврата в центр бессмысленно.
+        if checked and self._paused_by_gaze:
+            self._log("Взгляд игнорируется — пауза по взгляду снимается.", COLORS["yellow"])
+            self._resume_experiment()
+
+    def _on_skip_calibration_toggled(self, checked: bool):
+        self.settings.setValue("service/skip_calibration", bool(checked))
+        if checked:
+            self._log(
+                "Калибровка будет пропущена при «Старте»: используются "
+                "сохранённые пороги или значения по умолчанию.",
+                COLORS["yellow"],
+            )
 
     def _build_sequence_box(self) -> QFrame:
         box, layout = self._make_subcard("Последовательность частот", COLORS["accent2"])
@@ -2369,12 +2422,19 @@ class MainWindow(QMainWindow):
             bg = "#35171a"
             border = COLORS["red"]
             fg = "#ffe0e0"
+            # При «игнорировать направление взгляда» паузы не будет —
+            # не пугаем пользователя словами про паузу.
+            tail = (
+                " (игнорируется)"
+                if self._ignore_gaze()
+                else "! Скорректируйте взгляд. Эксперимент на паузе."
+            )
             if position == "left":
-                text = "⚠ Взгляд смещён ВЛЕВО! Скорректируйте взгляд. Эксперимент на паузе."
+                text = f"⚠ Взгляд смещён ВЛЕВО{tail}"
             elif position == "right":
-                text = "⚠ Взгляд смещён ВПРАВО! Скорректируйте взгляд. Эксперимент на паузе."
+                text = f"⚠ Взгляд смещён ВПРАВО{tail}"
             else:
-                text = "⚠ Взгляд смещён! Скорректируйте взгляд. Эксперимент на паузе."
+                text = f"⚠ Взгляд смещён{tail}"
         self.gaze_indicator.setText(text)
         self.gaze_indicator.setStyleSheet(
             f"background-color:{bg};"
@@ -2683,10 +2743,14 @@ class MainWindow(QMainWindow):
             self._gaze_off = new_off
             self._set_gaze_indicator_style(new_pos)
             if self._running:
-                if new_off and not old_off:
+                # «Игнорировать направление взгляда»: отклонение не ставит
+                # эксперимент на паузу.
+                if new_off and not old_off and not self._ignore_gaze():
                     self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
             elif self._paused_by_gaze:
-                if not new_off and old_off:
+                # Пауза по взгляду снимается либо при возврате взгляда в центр,
+                # либо сразу, если включили «игнорировать направление взгляда».
+                if self._ignore_gaze() or (not new_off and old_off):
                     self._resume_experiment()
 
         # Ожидание старта после калибровки: взгляд вернулся в центр — запускаем.
@@ -3473,12 +3537,17 @@ class MainWindow(QMainWindow):
             "ir_was_used": bool(any(r.get("ir_available") for r in records)),
             "ir_calibration_points_json": self._json_value(self.ir_calibration),
             "ir_invert_sensor_raw": bool(INVERT_SENSOR_RAW),
+            "ir_ignore_gaze": bool(self._ignore_gaze()),
+            "ir_skip_calibration": bool(self._skip_calibration()),
             "ir_classification_note": (
                 "ir_gaze_position is classified in Python per sensor (nearest-neighbor "
                 "against ir_calibration_points_json, distances normalized by per-sensor "
                 "sigma from 'scale' when present; sliding-median smoothed input, "
                 "state-change debounce, conjugate-gaze propagation to both eyes). "
-                "'forward' means gaze OK; 'left'/'right'/'off' trigger pause. "
+                "'forward' means gaze OK; 'left'/'right'/'off' trigger pause "
+                "unless ir_ignore_gaze is set (then gaze never pauses the "
+                "experiment and does not block start; ir_skip_calibration "
+                "means start skipped gaze calibration). "
                 "In default mode (no calibration) deviation uses the per-sensor "
                 "reflect flag. "
                 "Values in ir_* columns are already inverted if ir_invert_sensor_raw=True: "
@@ -3986,19 +4055,35 @@ class MainWindow(QMainWindow):
             return
 
         self.start_btn.setEnabled(False)
+        # «Пропустить калибровку» (флажок в «Сервисе»): стартуем сразу.
+        # Классификация взгляда работает по сохранённой калибровке, а если её
+        # нет — по порогам по умолчанию (порог АЦП прошивки, «виден зрачок»).
+        if self._skip_calibration():
+            self._log(
+                "Калибровка пропущена: используются сохранённые пороги "
+                "или значения по умолчанию.",
+                COLORS["yellow"],
+            )
+            self._start_experiment()
+            return
         # После успешной калибровки эксперимент стартует автоматически.
         if not self._start_calibration(after=self._start_experiment):
             self.start_btn.setEnabled(self.serial.is_open)
 
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда."""
-        if self._gaze_off:
+        if self._gaze_off and not self._ignore_gaze():
             # Последняя фаза калибровки — «ВПРАВО»: взгляд ещё не успел
             # вернуться в центр. Не считаем это ошибкой — ждём возврата
             # взгляда и стартуем автоматически.
             self._waiting_gaze_center = True
+            prefix = (
+                "Калибровка пропущена."
+                if self._skip_calibration()
+                else "Калибровка завершена."
+            )
             self._log(
-                "Калибровка завершена. Верните взгляд в центр — "
+                f"{prefix} Верните взгляд в центр — "
                 "эксперимент стартует автоматически.",
                 COLORS["accent"],
             )
@@ -4051,7 +4136,7 @@ class MainWindow(QMainWindow):
             )
             self.start_btn.setEnabled(self.serial.is_open)
             return
-        if self._gaze_off:
+        if self._gaze_off and not self._ignore_gaze():
             self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
             self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
             self.start_btn.setEnabled(self.serial.is_open)
