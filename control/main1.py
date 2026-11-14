@@ -121,9 +121,13 @@ ADC_MAX_VALUE = 4095
 # Если когда-нибудь поменяете схему — поставьте False.
 INVERT_SENSOR_RAW = True
 
-# Классификация взгляда (nearest neighbor / default mode)
-DEFAULT_GAZE_DIFF_THRESHOLD = 200.0
-GAZE_CLASSIFY_HYSTERESIS = 100.0
+# Классификация взгляда по нормированным проекциям (при наличии калибровки).
+# s = (raw − forward) / (ref_стороны − forward): 0 в центре, 1 в опорной точке.
+GAZE_PROJECTION_ON = 0.5       # уход из центра: пройдено ≥50% пути к стороне
+GAZE_PROJECTION_OFF = 0.25     # возврат в центр: путь сократился до ≤25%
+GAZE_PROJECTION_MIN_SEP_RAW = 40.0   # минимальное смещение стороны, отсчёты
+# Минимальное смещение стороны в σ датчика: ниже — сторона неразличима.
+GAZE_PROJECTION_MIN_SEP_SIGMA = 2.5
 MIN_CALIBRATION_SEPARATION = 80.0
 
 # ── Устойчивость классификации (антидребезг) ──────────────────────────────────
@@ -132,16 +136,15 @@ IR_MEDIAN_WINDOW = 5
 # Новое состояние глаза должно продержаться указанное число свежих отсчётов
 # подряд, прежде чем сменить текущее (при 10 Гц это ~200 мс задержки).
 IR_DEBOUNCE_COUNT = 3
-# Гистерезис в нормированных единицах (доля σ датчика) — используется, когда
-# калибровка сохранена вместе с нормировкой датчиков.
-GAZE_HYSTERESIS_NORM = 0.5
 # Нижняя граница нормировки: не усиливаем шумы «идеально тихого» датчика.
 MIN_SENSOR_SCALE = 30.0
 
 # ── Качество фазы калибровки ──────────────────────────────────────────────────
-CALIBRATION_MIN_SAMPLES = 3
-CALIBRATION_MAX_STD = 250.0    # σ отсчётов фазы, выше которой фаза «дрожит»
+CALIBRATION_MIN_SAMPLES = 8    # после отбрасывания первых 0.5 с фазы
+CALIBRATION_MAX_STD = 250.0    # σ (устойчивая, MAD) фазы, выше — «дрожит»
 CALIBRATION_MAX_RETRIES = 2    # сколько раз проблемная фаза повторяется
+# Первые 0.5 с фазы не собираем: взгляд ещё перемещается к цели.
+CALIBRATION_SETTLE_SECONDS = 0.5
 
 # Датчик считается отключённым, если от него давно нет телеметрии (с).
 # Прошивка шлёт данные каждые 100 мс, поэтому 3 с — это ~30 пропущенных
@@ -565,6 +568,38 @@ def invert_adc(value: float) -> float:
     if INVERT_SENSOR_RAW:
         return float(ADC_MAX_VALUE) - float(value)
     return float(value)
+
+
+def _robust_sigma(values) -> float | None:
+    """Устойчивая σ по MAD (1.4826·MAD): не раздувается от одиночных выбросов."""
+    vals = np.asarray([float(v) for v in values if np.isfinite(v)], dtype=float)
+    if vals.size < 2:
+        return None
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med)))
+    return float(1.4826 * mad)
+
+
+def _robust_median(values, trim_sigma: float = 3.0, min_abs: float = 30.0):
+    """Медиана с отбрасыванием выбросов → (median, sigma, n).
+
+    Отбрасываются отсчёты дальше ``max(trim_sigma·σ, min_abs)`` от медианы
+    (например, моменты моргания или неполного перевода взгляда), затем
+    медиана и σ пересчитываются по оставшимся.
+    """
+    vals = np.asarray([float(v) for v in values if np.isfinite(v)], dtype=float)
+    if vals.size == 0:
+        return None, None, 0
+    med = float(np.median(vals))
+    sigma = _robust_sigma(vals)
+    if vals.size >= 5 and sigma is not None:
+        limit = max(float(trim_sigma) * sigma, float(min_abs))
+        kept = vals[np.abs(vals - med) <= limit]
+        if kept.size >= 3:
+            vals = kept
+            med = float(np.median(vals))
+            sigma = _robust_sigma(vals)
+    return med, sigma, int(vals.size)
 
 
 class LSLRecordingWorker(threading.Thread):
@@ -1093,11 +1128,14 @@ class MainWindow(QMainWindow):
         self._gaze_last_seen = [0.0, 0.0]
         self._ir_table_max_rows = 100
 
-        # ── IR calibration (nearest-neighbor reference points) ──────────────
+        # ── IR calibration (reference points + projection classifier) ────────
         self.ir_calibration: dict = {}
         self._calibration_in_progress = False
         self._calibration_phase = 0
         self._calibration_phase_collecting = False
+        # Момент старта сбора фазы: первые CALIBRATION_SETTLE_SECONDS не
+        # собираем — взгляд ещё перемещается к цели.
+        self._calibration_phase_started_at = 0.0
         # Продолжение, которое запускается после успешной калибровки
         # (калибровка всегда выполняется перед стартом эксперимента).
         self._calibration_after = None
@@ -2579,33 +2617,41 @@ class MainWindow(QMainWindow):
         Возвращает по датчику: ``available`` (есть свежая телеметрия),
         ``deviated`` (взгляд смещён) и ``direction`` (left/right/off/center).
 
-        При наличии калибровки направление берётся из ближайшей опорной точки
-        этого датчика (одномерный nearest neighbor по его raw со своей
-        гистерезисной памятью). Без калибровки смещение определяется по
-        признаку «виден зрачок» (нет отражения).
+        При наличии калибровки направление считается по **нормированным
+        проекциям** отклонения от точки «вперёд»:
+        ``s = (raw − forward) / (ref_стороны − forward)`` — доля пройденного
+        пути к опорной точке стороны. В отличие от nearest-neighbor это не
+        «притягивается» к ближней опорной точке при асимметричных смещениях.
+        Без калибровки смещение определяется по признаку «виден зрачок».
 
         Устойчивость классификации:
           • вход — скользящая медиана последних отсчётов (не мгновенный raw);
-          • если в калибровке сохранена нормировка (σ датчика), расстояния
-            делятся на неё — датчики с разной чувствительностью сравниваются
-            одинаково, а гистерезис задаётся в долях σ;
+          • сторона учитывается, только если её смещение от «вперёд» не меньше
+            ``max(2.5·σ, 40)`` отсчётов — иначе датчик её не различает;
+          • гистерезис ON/OFF (0.5 / 0.25 в долях пути) удерживает состояние
+            у границы;
           • новое состояние должно продержаться IR_DEBOUNCE_COUNT свежих
             отсчёта подряд, прежде чем сменить текущее.
 
-        Глаза человека сопряжены — смотреть врозь невозможно. Поэтому после
-        поканальной классификации применяется общее правило: если хотя бы
-        один датчик уверенно определил направление (влево/вправо), оно
-        засчитывается обоим глазам; если отклонение зафиксировано, но
-        направление неизвестно, смещёнными считаются оба глаза.
+        Глаза человека сопряжены — смотреть врозь невозможно. Поэтому
+        поканальные решения согласуются: лево + право = «в сторону»
+        (противоречие датчиков), иначе берётся ненулевое направление.
         """
         now = time.time()
         with self._ir_lock:
             sensors = [dict(s) for s in self._ir_sensors]
         cal = self.ir_calibration if isinstance(self.ir_calibration, dict) else {}
-        forward_ref = cal.get("forward") if isinstance(cal.get("forward"), dict) else {}
+
+        def ref_value(name: str, idx: int):
+            ref = cal.get(name)
+            if not isinstance(ref, dict):
+                return np.nan
+            value = ref.get(f"s{idx}", np.nan)
+            if isinstance(value, (int, float)) and np.isfinite(value):
+                return float(value)
+            return np.nan
 
         states = []
-        scores: list[float | None] = []
         for idx, s in enumerate(sensors):
             last_update = float(s.get("last_update") or 0.0)
             fresh = bool(s.get("available")) and (now - last_update) <= IR_STALE_SECONDS
@@ -2614,108 +2660,125 @@ class MainWindow(QMainWindow):
                 self._sensor_eye_pending[idx] = None
                 self._gaze_last_seen[idx] = 0.0
                 states.append({"available": False, "deviated": False, "direction": "center"})
-                scores.append(None)
                 continue
 
             # Классификация идёт по сглаженному значению (медиана окна),
             # а не по мгновенному отсчёту.
             raw_val = s.get("raw_f", s.get("raw", np.nan))
-            f_ref = forward_ref.get(f"s{idx}", np.nan)
-            deviated = False
-            direction = "center"
-            score: float | None = None
+            f_ref = ref_value("forward", idx)
+            calibrated = np.isfinite(raw_val) and np.isfinite(f_ref)
 
-            scale = self._sensor_scale(idx)
-            if np.isfinite(raw_val) and isinstance(f_ref, (int, float)) and np.isfinite(f_ref):
-                # Расстояния до опорных точек. Нормировка на σ датчика
-                # (если она есть в калибровке) делает датчики с разной
-                # чувствительностью сопоставимыми.
-                inv = 1.0 / max(float(scale), MIN_SENSOR_SCALE) if scale else 1.0
-                candidates = {"forward": abs(float(raw_val) - float(f_ref)) * inv}
-                for name in ("left", "right"):
-                    ref = cal.get(name)
-                    ref_val = ref.get(f"s{idx}", np.nan) if isinstance(ref, dict) else np.nan
-                    if isinstance(ref_val, (int, float)) and np.isfinite(ref_val):
-                        candidates[name] = abs(float(raw_val) - float(ref_val)) * inv
-                nearest = min(candidates, key=candidates.get)
-                current = self._sensor_eye_pos[idx]
-                # Гистерезис: в нормированных единицах, если есть нормировка,
-                # иначе в сырых единицах (совместимость со старыми калибровками).
-                hysteresis = GAZE_HYSTERESIS_NORM if scale else GAZE_CLASSIFY_HYSTERESIS
-                if (
-                    current in candidates
-                    and current != nearest
-                    and candidates[current] - candidates[nearest] < hysteresis
-                ):
-                    nearest = current
-
-                # Временной дебаунс: новое состояние должно продержаться
-                # IR_DEBOUNCE_COUNT свежих отсчёта подряд, прежде чем сменить
-                # текущее. Счётчик растёт только на новых отсчётах.
-                if nearest != current:
-                    pending = self._sensor_eye_pending[idx]
-                    has_new_data = last_update != self._gaze_last_seen[idx]
-                    if has_new_data:
-                        count = pending[1] + 1 if pending and pending[0] == nearest else 1
-                        self._sensor_eye_pending[idx] = (nearest, count)
-                        if count >= IR_DEBOUNCE_COUNT:
-                            self._sensor_eye_pos[idx] = nearest
-                            self._sensor_eye_pending[idx] = None
-                else:
-                    self._sensor_eye_pending[idx] = None
-                self._gaze_last_seen[idx] = last_update
-
-                deviated = self._sensor_eye_pos[idx] != "forward"
-                direction = self._sensor_eye_pos[idx] if deviated else "center"
-                # Уверенность направления: насколько опорная точка отклонения
-                # ближе, чем «вперёд» (в нормированных единицах).
-                if deviated:
-                    score = candidates["forward"] - candidates[self._sensor_eye_pos[idx]]
+            if calibrated:
+                sigma = self._sensor_scale(idx) or MIN_SENSOR_SCALE
+                target = self._direction_from_projection(
+                    float(raw_val),
+                    f_ref,
+                    ref_value("left", idx),
+                    ref_value("right", idx),
+                    float(sigma),
+                    self._sensor_eye_pos[idx],
+                )
+                if target is None:
+                    # Ни одна сторона этим датчиком не различается —
+                    # деградируем к признаку «виден зрачок».
+                    deviated_reflect = not bool(s.get("reflect", True))
+                    target = "off" if deviated_reflect else "forward"
             else:
-                deviated = not bool(s.get("reflect", True))
-                direction = "off" if deviated else "center"
-                self._sensor_eye_pos[idx] = "forward" if not deviated else "off"
+                deviated_reflect = not bool(s.get("reflect", True))
+                target = "off" if deviated_reflect else "forward"
+
+            # Временной дебаунс: новое состояние должно продержаться
+            # IR_DEBOUNCE_COUNT свежих отсчёта подряд, прежде чем сменить
+            # текущее. Счётчик растёт только на новых отсчётах.
+            current = self._sensor_eye_pos[idx]
+            if target != current:
+                pending = self._sensor_eye_pending[idx]
+                has_new_data = last_update != self._gaze_last_seen[idx]
+                if has_new_data:
+                    count = pending[1] + 1 if pending and pending[0] == target else 1
+                    self._sensor_eye_pending[idx] = (target, count)
+                    if count >= IR_DEBOUNCE_COUNT:
+                        self._sensor_eye_pos[idx] = target
+                        self._sensor_eye_pending[idx] = None
+            else:
                 self._sensor_eye_pending[idx] = None
-                self._gaze_last_seen[idx] = last_update
+            self._gaze_last_seen[idx] = last_update
 
-            states.append(
-                {
-                    "available": True,
-                    "deviated": deviated,
-                    "direction": direction,
-                }
-            )
-            scores.append(score)
+            states.append({"available": True, "deviated": False, "direction": "center"})
 
-        # Сопряжённый взгляд: уверенное направление одного датчика
-        # распространяется на оба глаза.
-        best_direction = None
-        best_score = -1.0
-        for st, sc in zip(states, scores):
-            if not (st["available"] and st["deviated"]):
-                continue
-            if st["direction"] not in ("left", "right"):
-                continue
-            sc = 0.0 if sc is None else sc
-            if sc > best_score:
-                best_score = sc
-                best_direction = st["direction"]
+        # Совместное решение по обоим глазам (взгляд сопряжён): согласование
+        # поканальных решений вместо «самый уверенный датчик навязывает
+        # направление обоим» — один шумный датчик больше не перебивает второй.
+        pos_list = [
+            self._sensor_eye_pos[idx]
+            for idx, st in enumerate(states)
+            if st["available"]
+        ]
+        has_left = "left" in pos_list
+        has_right = "right" in pos_list
+        if has_left and has_right:
+            joint = "off"          # датчики противоречат — направление неизвестно
+        elif has_left:
+            joint = "left"
+        elif has_right:
+            joint = "right"
+        elif "off" in pos_list:
+            joint = "off"
+        else:
+            joint = "forward"
 
-        if best_direction is not None:
-            for st in states:
-                if st["available"]:
-                    st["deviated"] = True
-                    st["direction"] = best_direction
-        elif any(st["available"] and st["deviated"] for st in states):
-            # Направление не смог определить ни один датчик, но отклонение
-            # зафиксировано — смещены оба глаза (сопряжённость).
-            for st in states:
-                if st["available"]:
-                    st["deviated"] = True
-                    if st["direction"] == "center":
-                        st["direction"] = "off"
+        for st in states:
+            if st["available"]:
+                st["deviated"] = joint != "forward"
+                st["direction"] = joint if joint != "forward" else "center"
 
         return states
+
+    @staticmethod
+    def _direction_from_projection(
+        raw_val: float,
+        f_ref: float,
+        left_ref: float,
+        right_ref: float,
+        sigma: float,
+        current: str,
+    ) -> str | None:
+        """Направление взгляда по одному датчику через нормированные проекции.
+
+        ``s = (raw − forward) / (ref_стороны − forward)`` — доля пройденного
+        пути к опорной точке стороны (≈0 в центре, ≈1 в её точке). В отличие
+        от nearest-neighbor это не «притягивается» к ближней опорной точке при
+        асимметричных смещениях (например, «вправо» может смещать датчик на
+        500 отсчётов, а «влево» — на 2000).
+
+        Сторона различима, только если её смещение от «вперёд» не меньше
+        ``max(2.5·σ, 40)`` отсчётов. Если не различима ни одна — возвращается
+        ``None`` (вызывающий использует признак «виден зрачок»).
+
+        Гистерезис: уход из центра при s ≥ 0.5, возврат — при s ≤ 0.25.
+        """
+        min_sep = max(GAZE_PROJECTION_MIN_SEP_SIGMA * float(sigma),
+                      GAZE_PROJECTION_MIN_SEP_RAW)
+        scores: dict[str, float] = {}
+        if np.isfinite(left_ref) and abs(float(left_ref) - float(f_ref)) >= min_sep:
+            scores["left"] = (float(raw_val) - float(f_ref)) / (
+                float(left_ref) - float(f_ref)
+            )
+        if np.isfinite(right_ref) and abs(float(right_ref) - float(f_ref)) >= min_sep:
+            scores["right"] = (float(raw_val) - float(f_ref)) / (
+                float(right_ref) - float(f_ref)
+            )
+        if not scores:
+            return None
+
+        best_dir = max(scores, key=scores.get)
+        if scores[best_dir] >= GAZE_PROJECTION_ON:
+            return best_dir
+        # Гистерезис: пока отклонение в текущую сторону не спало ниже OFF,
+        # состояние не меняется (не «дёргаемся» у границы).
+        if current in scores and scores[current] >= GAZE_PROJECTION_OFF:
+            return current
+        return "forward"
 
     def _sensor_scale(self, idx: int) -> float | None:
         """Нормировка датчика (σ из калибровки) или None, если её нет.
@@ -2765,7 +2828,13 @@ class MainWindow(QMainWindow):
         if self._calibration_in_progress and self._calibration_phase_collecting:
             if 0 <= self._calibration_phase < 3:
                 raw_val = ir_data.get("raw", np.nan)
-                if isinstance(raw_val, (int, float)) and np.isfinite(raw_val):
+                # Первые CALIBRATION_SETTLE_SECONDS фазы не собираем: взгляд
+                # ещё перемещается к цели, иначе медиана «уезжает» к прошлому
+                # положению (главная причина неточной калибровки).
+                settled = (
+                    now - self._calibration_phase_started_at
+                ) >= CALIBRATION_SETTLE_SECONDS
+                if settled and isinstance(raw_val, (int, float)) and np.isfinite(raw_val):
                     self._calibration_samples[self._calibration_phase][
                         f"sensor{sensor_id}"
                     ].append({"raw": float(raw_val), "reflect": is_reflect})
@@ -3099,12 +3168,18 @@ class MainWindow(QMainWindow):
             "sensor1": [],
         }
         self._calibration_phase_collecting = True
+        self._calibration_phase_started_at = time.time()
         self._log(f"Калибровка [{direction}]: сбор данных 3 с...", COLORS["accent"])
         self.status_bar.showMessage(f"Калибровка [{direction}]: сбор данных 3 с…")
         QTimer.singleShot(3000, self._calibration_phase_done)
 
     def _phase_stds(self, phase_idx: int) -> tuple:
-        """σ отсчётов фазы по каждому датчику (None, если отсчётов < 2)."""
+        """Устойчивая σ (MAD) отсчётов фазы по каждому датчику.
+
+        MAD не раздувается от одиночных выбросов (моргание, сбой АЦП), в
+        отличие от обычного std — иначе шумный датчик получал бы завышенную
+        нормировку и «размытые» пороги.
+        """
         out = []
         for key in ("sensor0", "sensor1"):
             raws = [
@@ -3112,7 +3187,7 @@ class MainWindow(QMainWindow):
                 for r in self._calibration_samples[phase_idx][key]
                 if np.isfinite(r["raw"])
             ]
-            out.append(float(np.std(raws)) if len(raws) >= 2 else None)
+            out.append(_robust_sigma(raws))
         return tuple(out)
 
     def _calibration_phase_done(self):
@@ -3177,7 +3252,10 @@ class MainWindow(QMainWindow):
 
         def median_for(phase_data, sensor_key):
             raws = [r["raw"] for r in phase_data[sensor_key] if np.isfinite(r["raw"])]
-            return float(np.median(raws)) if len(raws) >= MIN_SAMPLES else None
+            # Медиана с отбрасыванием выбросов: моргания и неполные переводы
+            # взгляда не сдвигают опорную точку.
+            med_val, _sigma, n = _robust_median(raws)
+            return med_val if n >= MIN_SAMPLES else None
 
         med: dict = {}
         for phase_name, phase_data in (
@@ -3257,6 +3335,37 @@ class MainWindow(QMainWindow):
                 sigma = float(np.median(finite))
                 if np.isfinite(sigma) and sigma > 0:
                     scale[f"s{idx}"] = max(sigma, MIN_SENSOR_SCALE)
+
+        # Различимость сторон по каждому датчику: |ref_стороны − forward| в σ.
+        # Асимметрия — норма (у «вправо» датчик может смещаться на 500
+        # отсчётов, у «влево» — на 2000), но слишком слабую сторону датчик
+        # физически не видит; об этом предупреждаем сразу.
+        weak_sides = []
+        for idx in (0, 1):
+            sigma = float(scale.get(f"s{idx}", MIN_SENSOR_SCALE))
+            min_sep = max(
+                GAZE_PROJECTION_MIN_SEP_SIGMA * sigma, GAZE_PROJECTION_MIN_SEP_RAW
+            )
+            parts = []
+            for side_name, side_ref in (("влево", l), ("вправо", r)):
+                delta = abs(float(side_ref[f"s{idx}"]) - float(f[f"s{idx}"]))
+                parts.append(
+                    f"{side_name} Δ={delta:.0f} ({delta / max(sigma, 1e-6):.2f}σ)"
+                )
+                if delta < min_sep:
+                    weak_sides.append(f"датчик {idx} — {side_name}")
+            self._log(
+                f"   датчик {idx}: " + ", ".join(parts),
+                COLORS["text_dim"],
+            )
+        if weak_sides:
+            self._log(
+                "Внимание: слабо различимы стороны — "
+                + "; ".join(weak_sides)
+                + ". Направление в эту сторону будет определяться хуже "
+                "(используется второй датчик).",
+                COLORS["yellow"],
+            )
 
         self.ir_calibration = {"left": l, "forward": f, "right": r}
         if scale:

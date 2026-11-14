@@ -18,7 +18,6 @@ static const uint8_t NUM_IR_SENSORS = 2;
 // sensor 0 = ПРАВО (A2), sensor 1 = ЛЕВО (A3) — соответствует «лицом к лицу» в UI.
 // A2/A3 не пересекаются с DAC0/DAC1 (PB15/PB16).
 static const uint8_t IR_PIN[NUM_IR_SENSORS] = {A2, A3};
-static const uint8_t IR_AVG_N = 8;           // окно усреднения
 static const uint16_t IR_ADC_MAX = 4095;
 static const float IR_VREF = 3.3f;
 static const uint16_t IR_TH_DEFAULT = 1500;  // raw < порога => есть отражение
@@ -61,10 +60,11 @@ volatile bool g_irReflect[NUM_IR_SENSORS] = {false, false};
 volatile uint16_t g_irTh[NUM_IR_SENSORS] = {IR_TH_DEFAULT, IR_TH_DEFAULT};
 volatile uint16_t g_irHyst[NUM_IR_SENSORS] = {IR_HY_DEFAULT, IR_HY_DEFAULT};
 
-uint16_t g_irBuf[NUM_IR_SENSORS][IR_AVG_N] = {{0}};
-uint32_t g_irSum[NUM_IR_SENSORS] = {0, 0};
-uint8_t g_irIdx[NUM_IR_SENSORS] = {0, 0};
-uint8_t g_irFilled[NUM_IR_SENSORS] = {0, 0};
+// Накопители окна 100 мс: raw = среднее по ВСЕМУ окну, а не по нескольким
+// отсчётам подряд. Иначе одна «мгновенная» точка раз в 100 мс ловит шум и
+// пульсации 100 Гц (алиасинг) — из-за этого калибровка взгляда «плыла».
+uint32_t g_irAcc[NUM_IR_SENSORS] = {0, 0};
+uint32_t g_irAccCount[NUM_IR_SENSORS] = {0, 0};
 
 float clampAmplitude(float a) { return constrain(a, 0.0f, MAX_AMPLITUDE); }
 float clampDC(float dc) { return constrain(dc, 0.0f, MAX_DC); }
@@ -273,32 +273,32 @@ void pollIR() {
         analogRead(IR_PIN[s]);
         uint16_t v = (uint16_t)analogRead(IR_PIN[s]);
 
-        g_irSum[s] -= g_irBuf[s][g_irIdx[s]];
-        g_irBuf[s][g_irIdx[s]] = v;
-        g_irSum[s] += v;
-        g_irIdx[s] = (uint8_t)((g_irIdx[s] + 1) % IR_AVG_N);
-        if (g_irFilled[s] < IR_AVG_N) g_irFilled[s]++;
-
-        uint16_t avg = (uint16_t)(g_irSum[s] / g_irFilled[s]);
-        g_irRaw[s] = avg;
-
+        // Копим всё окно до следующей отправки (100 мс): тысячи отсчётов
+        // вместо восьми подряд — шум и фоновая 100-герцовая пульсация
+        // усредняются полностью.
+        g_irAcc[s] += v;
+        g_irAccCount[s]++;
         if (v < g_irMin[s]) g_irMin[s] = v;
         if (v > g_irMax[s]) g_irMax[s] = v;
-
-        if (!g_irReflect[s] && avg < g_irTh[s]) {
-            g_irReflect[s] = true;
-        } else if (g_irReflect[s] && avg > (uint16_t)(g_irTh[s] + g_irHyst[s])) {
-            g_irReflect[s] = false;
-        }
     }
 }
 
 void emitIR(uint8_t s) {
-    uint16_t raw = g_irRaw[s];
+    uint32_t count = g_irAccCount[s];
+    uint16_t raw = count ? (uint16_t)(g_irAcc[s] / count) : g_irRaw[s];
+    g_irAcc[s] = 0;
+    g_irAccCount[s] = 0;
+    g_irRaw[s] = raw;
+
+    // Гистерезис состояния — по среднему за окно.
+    if (!g_irReflect[s] && raw < g_irTh[s]) {
+        g_irReflect[s] = true;
+    } else if (g_irReflect[s] && raw > (uint16_t)(g_irTh[s] + g_irHyst[s])) {
+        g_irReflect[s] = false;
+    }
+
     uint16_t mn = g_irMin[s];
     uint16_t mx = g_irMax[s];
-    bool refl = g_irReflect[s];
-
     g_irMin[s] = IR_ADC_MAX;
     g_irMax[s] = 0;
 
@@ -310,13 +310,20 @@ void emitIR(uint8_t s) {
     Serial.print(",\"v\":"); Serial.print(volts, 3);
     Serial.print(",\"min\":"); Serial.print(mn);
     Serial.print(",\"max\":"); Serial.print(mx);
-    Serial.print(",\"ref\":"); Serial.print(refl ? 1 : 0);
+    Serial.print(",\"ref\":"); Serial.print(g_irReflect[s] ? 1 : 0);
     Serial.print(",\"th\":"); Serial.print(g_irTh[s]);
     Serial.println("}");
 }
 
 void printIR() {
-    if (!g_irEnabled) return;
+    if (!g_irEnabled) {
+        // Телеметрия выключена — окно не копим, иначе счётчик переполнится.
+        for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+            g_irAcc[s] = 0;
+            g_irAccCount[s] = 0;
+        }
+        return;
+    }
     uint32_t now = millis();
     if (now - g_lastIrMs < 100) return;
     g_lastIrMs = now;
@@ -525,7 +532,7 @@ void setup() {
     NVIC_SetPriority(UART_IRQn, 0);
     NVIC_SetPriority(TC6_IRQn, 1);
 
-    Serial.println("READY dual_dac_sine v4.2 (ir tcrt5000 x2: A2/A3)");
+    Serial.println("READY dual_dac_sine v4.3 (ir tcrt5000 x2: A2/A3, 100ms window)");
 }
 
 void loop() {
