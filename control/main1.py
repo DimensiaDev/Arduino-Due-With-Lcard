@@ -1054,6 +1054,9 @@ class MainWindow(QMainWindow):
         self._sequence_stage_duration = 0.0
         self._sequence_stage_start_time: float | None = None
         self._sequence_stage_number = 0
+        # Момент, когда этап должен закончиться (monotonic). Защита от
+        # преждевременного перехода этапа, если таймер сработал раньше.
+        self._sequence_stage_deadline: float | None = None
 
         # ── Pause-by-gaze state ─────────────────────────────────────────────
         self._paused_by_gaze = False
@@ -1063,6 +1066,9 @@ class MainWindow(QMainWindow):
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
         self._resuming_after_gaze_pause = False
+        # Момент начала паузы: на него сдвигается общий таймер эксперимента,
+        # чтобы после долгой паузы не показывалось «Эксперимент: осталось 00:00».
+        self._pause_started_at: float | None = None
 
         # ── IR sensors ──────────────────────────────────────────────────────
         self._ir_lock = threading.Lock()
@@ -3247,6 +3253,7 @@ class MainWindow(QMainWindow):
 
         self._paused_by_gaze = True
         self._resuming_after_gaze_pause = False
+        self._pause_started_at = time.monotonic()
         self._log(f"⏸ ПАУЗА: {reason}. Отправка STOP.", COLORS["yellow"])
         self.status_bar.showMessage(f"⏸ Пауза: {reason}")
 
@@ -3266,6 +3273,7 @@ class MainWindow(QMainWindow):
                 self._pause_remaining_seconds = 0.0
                 self._pause_step_index = -1
 
+        self._sequence_stage_deadline = None
         self._sequence_timer.stop()
         self._sequence_progress_timer.stop()
         self._auto_apply_timer.stop()
@@ -3279,6 +3287,12 @@ class MainWindow(QMainWindow):
         self._paused_by_gaze = False
         self._running = True
         self._resuming_after_gaze_pause = True
+        # Пауза не должна «съедать» общее время эксперимента: сдвигаем старт
+        # общего таймера на длительность паузы (иначе после долгой паузы
+        # показывается «Эксперимент: осталось 00:00», как будто всё кончилось).
+        if self._pause_started_at is not None and self._sequence_total_start_time is not None:
+            self._sequence_total_start_time += time.monotonic() - self._pause_started_at
+        self._pause_started_at = None
         # В окне медианы ещё лежат отсчёты «смещённого» взгляда — очищаем,
         # чтобы первые пакеты после возобновления не поставили паузу снова.
         with self._ir_lock:
@@ -3291,8 +3305,19 @@ class MainWindow(QMainWindow):
 
         if self.sequence_steps:
             if self._pause_step_index >= 0:
-                self._sequence_index = self._pause_step_index
+                # Продолжаем именно приостановленный этап с его остатком;
+                # индекс всегда в допустимых пределах — иначе «завершение
+                # эксперимента» случилось бы раньше последнего этапа.
+                self._sequence_index = min(
+                    self._pause_step_index, len(self.sequence_steps) - 1
+                )
                 self._sequence_override_seconds = self._pause_remaining_seconds
+                self._log(
+                    f"   продолжаем этап {self._sequence_index + 1}/"
+                    f"{len(self.sequence_steps)} с остатком "
+                    f"{self._pause_remaining_seconds:.2f} с",
+                    COLORS["accent"],
+                )
             self._run_next_sequence_step()
         else:
             if self.serial.is_open:
@@ -4125,6 +4150,8 @@ class MainWindow(QMainWindow):
         self._pause_step_index = -1
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
+        self._pause_started_at = None
+        self._sequence_stage_deadline = None
 
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда."""
@@ -4217,6 +4244,8 @@ class MainWindow(QMainWindow):
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
         self._resuming_after_gaze_pause = False
+        self._pause_started_at = None
+        self._sequence_stage_deadline = None
         self._reset_sequence_progress(self._sequence_total_seconds())
         self._running = True
         self.start_btn.setEnabled(False)
@@ -4238,7 +4267,22 @@ class MainWindow(QMainWindow):
             self._abort_sequence("serial-порт отключен")
             return
 
+        # Защита от досрочного перехода: если таймер сработал раньше конца
+        # этапа (устаревшее событие после паузы/возобновления), просто
+        # перевзводим его на остаток, а не начинаем следующий этап.
+        if self._sequence_stage_deadline is not None:
+            remaining = self._sequence_stage_deadline - time.monotonic()
+            if remaining > 0.05:
+                self._sequence_timer.start(max(1, int(remaining * 1000)))
+                return
+            self._sequence_stage_deadline = None
+
         if self._sequence_index >= len(self.sequence_steps):
+            self._log(
+                f"Все этапы выполнены ({len(self.sequence_steps)}/"
+                f"{len(self.sequence_steps)}) — завершение эксперимента.",
+                COLORS["green"],
+            )
             self._finish_sequence()
             return
 
@@ -4317,6 +4361,7 @@ class MainWindow(QMainWindow):
         self._pause_step_index = -1
         self._begin_sequence_stage_progress(step_no, total, effective_seconds)
         self._sequence_index += 1
+        self._sequence_stage_deadline = time.monotonic() + float(effective_seconds)
         self._sequence_timer.start(max(1, int(effective_seconds * 1000)))
 
     def _finish_sequence(self):
@@ -4341,6 +4386,8 @@ class MainWindow(QMainWindow):
         self._sequence_override_seconds = None
         self._paused_by_gaze = False
         self._resuming_after_gaze_pause = False
+        self._pause_started_at = None
+        self._sequence_stage_deadline = None
         self.start_btn.setEnabled(self.serial.is_open)
         self.stop_btn.setEnabled(False)
         self.sequence_load_btn.setEnabled(True)
@@ -4392,6 +4439,8 @@ class MainWindow(QMainWindow):
             self._waiting_gaze_center = False
             self._start_now_once = False
             self._sequence_index = 0
+            self._pause_started_at = None
+            self._sequence_stage_deadline = None
             self.start_btn.setEnabled(self.serial.is_open)
             self.stop_btn.setEnabled(False)
             self.sequence_load_btn.setEnabled(True)
