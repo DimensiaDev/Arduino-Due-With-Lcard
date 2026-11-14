@@ -1053,6 +1053,7 @@ class MainWindow(QMainWindow):
         self._pause_step_index = -1
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
+        self._resuming_after_gaze_pause = False
 
         # ── IR sensors ──────────────────────────────────────────────────────
         self._ir_lock = threading.Lock()
@@ -2684,7 +2685,8 @@ class MainWindow(QMainWindow):
             if self._running:
                 if new_off and not old_off:
                     self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
-                elif not new_off and old_off:
+            elif self._paused_by_gaze:
+                if not new_off and old_off:
                     self._resume_experiment()
 
         # Ожидание старта после калибровки: взгляд вернулся в центр — запускаем.
@@ -3155,6 +3157,7 @@ class MainWindow(QMainWindow):
             return
 
         self._paused_by_gaze = True
+        self._resuming_after_gaze_pause = False
         self._log(f"⏸ ПАУЗА: {reason}. Отправка STOP.", COLORS["yellow"])
         self.status_bar.showMessage(f"⏸ Пауза: {reason}")
 
@@ -3179,11 +3182,14 @@ class MainWindow(QMainWindow):
         self._auto_apply_timer.stop()
         if self.serial.is_open:
             self._send("STOP")
+        self._running = False
 
     def _resume_experiment(self):
         if not self._paused_by_gaze:
             return
         self._paused_by_gaze = False
+        self._running = True
+        self._resuming_after_gaze_pause = True
         self._log("▶ Возобновление эксперимента.", COLORS["green"])
         self.status_bar.showMessage("▶ Возобновление")
 
@@ -4059,6 +4065,7 @@ class MainWindow(QMainWindow):
         self._pause_step_index = -1
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
+        self._resuming_after_gaze_pause = False
         self._reset_sequence_progress(self._sequence_total_seconds())
         self._running = True
         self.start_btn.setEnabled(False)
@@ -4101,7 +4108,8 @@ class MainWindow(QMainWindow):
             COLORS["accent"],
         )
 
-        if self._sequence_index == 0 or self._pause_step_index >= 0:
+        needs_start = self._sequence_index == 0 or self._resuming_after_gaze_pause
+        if needs_start:
             ok = self._apply_sequence_step_params(
                 step,
                 include_static=True,
@@ -4135,6 +4143,7 @@ class MainWindow(QMainWindow):
                     step.dac1_f2,
                 )
             self._send("DBG ON")
+            self._resuming_after_gaze_pause = False
         else:
             if not self._apply_sequence_step_params(step, include_static=False):
                 self._abort_sequence("serial-порт не подключен")
@@ -4173,6 +4182,7 @@ class MainWindow(QMainWindow):
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
         self._paused_by_gaze = False
+        self._resuming_after_gaze_pause = False
         self.start_btn.setEnabled(self.serial.is_open)
         self.stop_btn.setEnabled(False)
         self.sequence_load_btn.setEnabled(True)
@@ -4186,6 +4196,7 @@ class MainWindow(QMainWindow):
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
         self._paused_by_gaze = False
+        self._resuming_after_gaze_pause = False
         if self._waiting_gaze_center:
             self._waiting_gaze_center = False
             self._log("Автостарт после калибровки отменён.", COLORS["yellow"])

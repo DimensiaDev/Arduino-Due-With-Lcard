@@ -400,18 +400,6 @@ QCheckBox#serial_status::indicator:checked, QCheckBox#lsl_status::indicator:chec
     background: {COLORS['green']};
     border-color: {COLORS['green']};
 }}
-QCheckBox#ignore_gaze_check {{
-    color: {COLORS['accent2']};
-    font-size: 12px;
-    font-weight: 600;
-    padding: 4px 2px;
-}}
-QCheckBox#calibration_enabled_check {{
-    color: {COLORS['accent']};
-    font-size: 12px;
-    font-weight: 600;
-    padding: 4px 2px;
-}}
 QTableWidget {{
     background-color: {COLORS['surface2']};
     border: 1px solid {COLORS['border']};
@@ -1065,23 +1053,7 @@ class MainWindow(QMainWindow):
         self._pause_step_index = -1
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
-
-        # ── Ignore-gaze flag (persisted) ────────────────────────────────────
-        # Если включено — эксперимент не ставится на паузу при смещении взгляда
-        # и стартует независимо от направления взгляда. Индикатор продолжает
-        # показывать реальное положение.
-        self._ignore_gaze = bool(
-            self.settings.value("gaze/ignore", False, type=bool)
-        )
-
-        # ── Calibration-enabled flag (persisted) ────────────────────────────
-        # Если включено — перед каждым стартом эксперимента выполняется
-        # калибровка взгляда (ВЛЕВО → ВПЕРЁД → ВПРАВО). Если выключено —
-        # калибровка пропускается, используется ранее сохранённая (или
-        # классификация по умолчанию по признаку видимости зрачка).
-        self._calibration_enabled = bool(
-            self.settings.value("calibration/enabled", True, type=bool)
-        )
+        self._resuming_after_gaze_pause = False
 
         # ── IR sensors ──────────────────────────────────────────────────────
         self._ir_lock = threading.Lock()
@@ -1163,19 +1135,9 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
-        # Синхронизируем чекбоксы с сохранённым состоянием (без вызова слотов).
-        self.ignore_gaze_check.blockSignals(True)
-        self.ignore_gaze_check.setChecked(self._ignore_gaze)
-        self.ignore_gaze_check.blockSignals(False)
-
-        self.calibration_enabled_check.blockSignals(True)
-        self.calibration_enabled_check.setChecked(self._calibration_enabled)
-        self.calibration_enabled_check.blockSignals(False)
-
         self._load_calibration()
         self._update_calibration_status_label()
         self._update_gaze_indicator_text()
-        self._set_gaze_indicator_style(self._current_gaze_pos)
 
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self._refresh_signal_stats)
@@ -1218,9 +1180,6 @@ class MainWindow(QMainWindow):
         # панелью глаз, единым блоком индикации взгляда.
         left.addWidget(self.gaze_indicator)
         left.addWidget(self.gaze_detail)
-        # Управление калибровкой и учётом взгляда — под индикатором.
-        left.addWidget(self._build_calibration_checkbox())
-        left.addWidget(self._build_ignore_gaze_checkbox())
         left.addStretch()
 
         left_w = QWidget()
@@ -1511,55 +1470,6 @@ class MainWindow(QMainWindow):
         )
         return self.gaze_eyes
 
-    def _build_calibration_checkbox(self) -> QWidget:
-        """Чекбокс «Проведение калибровки» на главном экране.
-
-        Если включён — при каждом старте эксперимента сначала выполняется
-        калибровка взгляда (ВЛЕВО → ВПЕРЁД → ВПРАВО). Если выключен —
-        калибровка пропускается, используется ранее сохранённая (или
-        классификация по умолчанию по признаку видимости зрачка).
-        """
-        w = QWidget()
-        layout = QHBoxLayout(w)
-        layout.setContentsMargins(2, 0, 2, 0)
-        self.calibration_enabled_check = QCheckBox("Проведение калибровки")
-        self.calibration_enabled_check.setObjectName("calibration_enabled_check")
-        self.calibration_enabled_check.setToolTip(
-            "Если включено, перед каждым стартом эксперимента выполняется "
-            "калибровка взгляда (ВЛЕВО → ВПЕРЁД → ВПРАВО, по 3 секунды).\n"
-            "Если выключено, калибровка пропускается и используется "
-            "предыдущая сохранённая (или классификация по умолчанию)."
-        )
-        self.calibration_enabled_check.toggled.connect(
-            self._on_calibration_enabled_changed
-        )
-        layout.addWidget(self.calibration_enabled_check)
-        layout.addStretch()
-        return w
-
-    def _build_ignore_gaze_checkbox(self) -> QWidget:
-        """Чекбокс «Игнорировать направление взгляда» на главном экране.
-
-        Если включён — эксперимент не ставится на паузу при смещении взгляда
-        и стартует независимо от направления взгляда. Индикатор взгляда при
-        этом продолжает отображать реальное положение, но с пометкой
-        «(игнорируется)».
-        """
-        w = QWidget()
-        layout = QHBoxLayout(w)
-        layout.setContentsMargins(2, 0, 2, 0)
-        self.ignore_gaze_check = QCheckBox("Игнорировать направление взгляда")
-        self.ignore_gaze_check.setObjectName("ignore_gaze_check")
-        self.ignore_gaze_check.setToolTip(
-            "Если включено, эксперимент не ставится на паузу при смещении "
-            "взгляда и стартует независимо от направления взгляда.\n"
-            "Индикатор взгляда продолжает отображать реальное положение."
-        )
-        self.ignore_gaze_check.toggled.connect(self._on_ignore_gaze_changed)
-        layout.addWidget(self.ignore_gaze_check)
-        layout.addStretch()
-        return w
-
     def _build_global_box(self) -> QFrame:
         box, layout = self._make_subcard("Общие параметры", COLORS["accent"])
         grid = QGridLayout()
@@ -1722,11 +1632,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.calibration_status_label)
 
         calib_hint = QLabel(
-            "Калибровка выполняется перед каждым стартом эксперимента, если "
-            "включена галочка «Проведение калибровки» на главном экране: "
-            "ВЛЕВО → ВПЕРЁД → ВПРАВО, по 3 секунды на фазу. "
-            "Если галочка снята — калибровка пропускается и используется "
-            "предыдущая сохранённая."
+            "Калибровка выполняется автоматически перед каждым стартом "
+            "эксперимента: ВЛЕВО → ВПЕРЁД → ВПРАВО, по 3 секунды на фазу."
         )
         calib_hint.setObjectName("hint_label")
         calib_hint.setWordWrap(True)
@@ -2463,20 +2370,11 @@ class MainWindow(QMainWindow):
             border = COLORS["red"]
             fg = "#ffe0e0"
             if position == "left":
-                base = "⚠ Взгляд смещён ВЛЕВО!"
+                text = "⚠ Взгляд смещён ВЛЕВО! Скорректируйте взгляд. Эксперимент на паузе."
             elif position == "right":
-                base = "⚠ Взгляд смещён ВПРАВО!"
+                text = "⚠ Взгляд смещён ВПРАВО! Скорректируйте взгляд. Эксперимент на паузе."
             else:
-                base = "⚠ Взгляд смещён!"
-            if self._ignore_gaze:
-                if self._running:
-                    text = f"{base} (игнорируется — эксперимент продолжается)"
-                else:
-                    text = f"{base} (игнорируется)"
-            elif self._running:
-                text = f"{base} Скорректируйте взгляд. Эксперимент на паузе."
-            else:
-                text = f"{base} Скорректируйте взгляд."
+                text = "⚠ Взгляд смещён! Скорректируйте взгляд. Эксперимент на паузе."
         self.gaze_indicator.setText(text)
         self.gaze_indicator.setStyleSheet(
             f"background-color:{bg};"
@@ -2487,86 +2385,6 @@ class MainWindow(QMainWindow):
             f"font-weight:700;"
             f"padding:10px;"
         )
-
-    def _has_calibration_data(self) -> bool:
-        """Есть ли сохранённая (валидная) калибровка взгляда.
-
-        Проверка взгляда при старте имеет смысл только если есть опорные
-        точки — иначе классификация опирается на резервную логику по
-        признаку отражения, которая без калибровки может давать ложные
-        срабатывания и блокировать запуск.
-        """
-        return bool(
-            isinstance(self.ir_calibration, dict)
-            and "forward" in self.ir_calibration
-            and isinstance(self.ir_calibration["forward"], dict)
-        )
-
-    def _on_calibration_enabled_changed(self, checked: bool):
-        """Включение/выключение автоматической калибровки при старте.
-
-        • Включили: при следующем старте эксперимента сначала выполнится
-          калибровка взгляда (ВЛЕВО → ВПЕРЁД → ВПРАВО).
-        • Выключили: калибровка при старте пропускается, используется
-          предыдущая сохранённая (или классификация по умолчанию).
-        """
-        self._calibration_enabled = bool(checked)
-        self.settings.setValue("calibration/enabled", self._calibration_enabled)
-        if self._calibration_enabled:
-            self._log(
-                "Калибровка при старте включена: перед запуском будет выполнена "
-                "калибровка взгляда.",
-                COLORS["accent"],
-            )
-        else:
-            self._log(
-                "Калибровка при старте отключена: будет использована предыдущая "
-                "сохранённая калибровка (или режим по умолчанию).",
-                COLORS["accent"],
-            )
-        self._update_calibration_status_label()
-
-    def _on_ignore_gaze_changed(self, checked: bool):
-        """Включение/выключение игнорирования направления взгляда.
-
-        • Включили: снимаем паузу по взгляду (если была), запускаем
-          эксперимент, если ждали возврата в центр.
-        • Выключили: если взгляд смещён и эксперимент идёт — сразу ставим
-          на паузу.
-        """
-        self._ignore_gaze = bool(checked)
-        self.settings.setValue("gaze/ignore", self._ignore_gaze)
-        self._set_gaze_indicator_style(self._current_gaze_pos)
-
-        if self._ignore_gaze:
-            if self._paused_by_gaze:
-                self._resume_experiment()
-            if (
-                self._waiting_gaze_center
-                and not self._running
-                and not self._calibration_in_progress
-            ):
-                self._waiting_gaze_center = False
-                self.stop_btn.setEnabled(False)
-                self._log(
-                    "Игнорирование взгляда включено — запуск без ожидания центра.",
-                    COLORS["accent"],
-                )
-                QTimer.singleShot(100, self._start_experiment)
-            else:
-                self._log(
-                    "Игнорирование взгляда включено: паузы по взгляду отключены.",
-                    COLORS["accent"],
-                )
-        else:
-            self._log(
-                "Игнорирование взгляда выключено: паузы по взгляду включены.",
-                COLORS["accent"],
-            )
-            if self._running and self._gaze_off and not self._paused_by_gaze:
-                self._pause_experiment(
-                    reason=f"взгляд {gaze_position_label(self._current_gaze_pos)}"
-                )
 
     def _update_gaze_indicator_text(self):
         if not hasattr(self, "gaze_detail"):
@@ -2865,28 +2683,22 @@ class MainWindow(QMainWindow):
             self._gaze_off = new_off
             self._set_gaze_indicator_style(new_pos)
             if self._running:
-                if new_off and not old_off and not self._ignore_gaze:
+                if new_off and not old_off:
                     self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
-                elif not new_off and old_off:
+            elif self._paused_by_gaze:
+                if not new_off and old_off:
                     self._resume_experiment()
 
-        # Ожидание старта после калибровки: взгляд вернулся в центр (или
-        # включено игнорирование) — запускаем эксперимент.
+        # Ожидание старта после калибровки: взгляд вернулся в центр — запускаем.
         if (
             self._waiting_gaze_center
+            and not self._gaze_off
             and not self._running
             and not self._calibration_in_progress
-            and (not self._gaze_off or self._ignore_gaze)
         ):
             self._waiting_gaze_center = False
             self.stop_btn.setEnabled(False)
-            if self._gaze_off:
-                self._log(
-                    "Игнорирование взгляда включено — запуск эксперимента.",
-                    COLORS["green"],
-                )
-            else:
-                self._log("Взгляд в центре — запуск эксперимента.", COLORS["green"])
+            self._log("Взгляд в центре — запуск эксперимента.", COLORS["green"])
             QTimer.singleShot(250, self._start_experiment)
 
         self._update_gaze_indicator_with_states(states)
@@ -2945,17 +2757,12 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "calibration_status_label"):
             return
         cal = self.ir_calibration
-        enabled_note = (
-            ""
-            if getattr(self, "_calibration_enabled", True)
-            else "   [калибровка при старте отключена]"
-        )
         if not cal or "forward" not in cal:
             mode_note = " (инвертированные показания)" if INVERT_SENSOR_RAW else ""
             self.calibration_status_label.setText(
                 "Калибровка: не выполнена. По умолчанию смещение определяется "
                 "по видимости зрачка датчиком (нет отражения — смещён)."
-                f"{mode_note}{enabled_note}"
+                f"{mode_note}"
             )
             return
         parts = []
@@ -2966,9 +2773,7 @@ class MainWindow(QMainWindow):
         scale = cal.get("scale")
         if isinstance(scale, dict):
             parts.append(f"σ: право={scale.get('s0', 0):.0f}, лево={scale.get('s1', 0):.0f}")
-        self.calibration_status_label.setText(
-            "Калибровка: " + "   |   ".join(parts) + enabled_note
-        )
+        self.calibration_status_label.setText("Калибровка: " + "   |   ".join(parts))
 
     def _load_calibration(self):
         try:
@@ -3352,6 +3157,7 @@ class MainWindow(QMainWindow):
             return
 
         self._paused_by_gaze = True
+        self._resuming_after_gaze_pause = False
         self._log(f"⏸ ПАУЗА: {reason}. Отправка STOP.", COLORS["yellow"])
         self.status_bar.showMessage(f"⏸ Пауза: {reason}")
 
@@ -3376,11 +3182,14 @@ class MainWindow(QMainWindow):
         self._auto_apply_timer.stop()
         if self.serial.is_open:
             self._send("STOP")
+        self._running = False
 
     def _resume_experiment(self):
         if not self._paused_by_gaze:
             return
         self._paused_by_gaze = False
+        self._running = True
+        self._resuming_after_gaze_pause = True
         self._log("▶ Возобновление эксперимента.", COLORS["green"])
         self.status_bar.showMessage("▶ Возобновление")
 
@@ -3664,15 +3473,12 @@ class MainWindow(QMainWindow):
             "ir_was_used": bool(any(r.get("ir_available") for r in records)),
             "ir_calibration_points_json": self._json_value(self.ir_calibration),
             "ir_invert_sensor_raw": bool(INVERT_SENSOR_RAW),
-            "ignore_gaze": bool(self._ignore_gaze),
-            "calibration_enabled": bool(self._calibration_enabled),
             "ir_classification_note": (
                 "ir_gaze_position is classified in Python per sensor (nearest-neighbor "
                 "against ir_calibration_points_json, distances normalized by per-sensor "
                 "sigma from 'scale' when present; sliding-median smoothed input, "
                 "state-change debounce, conjugate-gaze propagation to both eyes). "
-                "'forward' means gaze OK; 'left'/'right'/'off' trigger pause unless "
-                "'ignore_gaze' is True. "
+                "'forward' means gaze OK; 'left'/'right'/'off' trigger pause. "
                 "In default mode (no calibration) deviation uses the per-sensor "
                 "reflect flag. "
                 "Values in ir_* columns are already inverted if ir_invert_sensor_raw=True: "
@@ -4163,11 +3969,11 @@ class MainWindow(QMainWindow):
         return True
 
     def _start(self):
-        """Старт эксперимента: калибровка взгляда выполняется, если включена."""
+        """Старт эксперимента: сначала ВСЕГДА калибровка взгляда с нуля."""
         if self._calibration_in_progress:
             self._log("Калибровка уже выполняется.", COLORS["yellow"])
             return
-        if self._waiting_gaze_center and not self._ignore_gaze:
+        if self._waiting_gaze_center:
             self._log(
                 "Старт уже ожидает возврата взгляда в центр — "
                 "эксперимент начнётся автоматически.",
@@ -4180,49 +3986,25 @@ class MainWindow(QMainWindow):
             return
 
         self.start_btn.setEnabled(False)
-
-        if self._calibration_enabled:
-            # После успешной калибровки эксперимент стартует автоматически.
-            if not self._start_calibration(after=self._start_experiment):
-                self.start_btn.setEnabled(self.serial.is_open)
-        else:
-            self._log(
-                "Калибровка при старте отключена — запуск эксперимента без калибровки.",
-                COLORS["accent"],
-            )
-            self._start_experiment()
+        # После успешной калибровки эксперимент стартует автоматически.
+        if not self._start_calibration(after=self._start_experiment):
+            self.start_btn.setEnabled(self.serial.is_open)
 
     def _start_experiment(self):
-        """Продолжение старта — вызывается сразу после калибровки взгляда
-        (или напрямую, если калибровка при старте отключена)."""
-        # Проверка взгляда при старте имеет смысл только когда есть
-        # сохранённая калибровка. Без опорных точек классификация опирается
-        # на резервную логику (reflect) и может давать ложные срабатывания,
-        # из-за которых эксперимент не запускается вовсе. Поэтому без
-        # калибровки старт выполняется независимо от направления взгляда
-        # (но пауза по взгляду во время эксперимента продолжает работать,
-        # если не включено «Игнорировать направление взгляда»).
-        has_cal = self._has_calibration_data()
-        gaze_blocks_start = (
-            self._gaze_off
-            and not self._ignore_gaze
-            and has_cal
-        )
-        if gaze_blocks_start:
+        """Продолжение старта — вызывается сразу после калибровки взгляда."""
+        if self._gaze_off:
+            # Последняя фаза калибровки — «ВПРАВО»: взгляд ещё не успел
+            # вернуться в центр. Не считаем это ошибкой — ждём возврата
+            # взгляда и стартуем автоматически.
             self._waiting_gaze_center = True
             self._log(
-                "Верните взгляд в центр — эксперимент стартует автоматически.",
+                "Калибровка завершена. Верните взгляд в центр — "
+                "эксперимент стартует автоматически.",
                 COLORS["accent"],
             )
             self.status_bar.showMessage("Верните взгляд в центр — эксперимент начнётся автоматически")
             self.stop_btn.setEnabled(True)  # Стоп отменяет ожидание старта
             return
-        if self._gaze_off and not self._ignore_gaze and not has_cal:
-            self._log(
-                "Взгляд определён как смещённый, но калибровка отсутствует — "
-                "проверка взгляда при старте пропущена.",
-                COLORS["yellow"],
-            )
 
         if self.sequence_steps:
             self._start_sequence()
@@ -4269,20 +4051,11 @@ class MainWindow(QMainWindow):
             )
             self.start_btn.setEnabled(self.serial.is_open)
             return
-        # Как и для одиночного запуска: проверка взгляда имеет смысл только
-        # при наличии калибровки; без неё классификация может давать ложные
-        # срабатывания и блокировать старт последовательности.
-        has_cal = self._has_calibration_data()
-        if self._gaze_off and not self._ignore_gaze and has_cal:
+        if self._gaze_off:
             self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
             self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
             self.start_btn.setEnabled(self.serial.is_open)
             return
-        if self._gaze_off and not self._ignore_gaze and not has_cal:
-            self._log(
-                "Взгляд смещён, но калибровка отсутствует — запуск без проверки взгляда.",
-                COLORS["yellow"],
-            )
         if not self._validate_lsl_recording_ready():
             self.start_btn.setEnabled(self.serial.is_open)
             return
@@ -4292,6 +4065,7 @@ class MainWindow(QMainWindow):
         self._pause_step_index = -1
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
+        self._resuming_after_gaze_pause = False
         self._reset_sequence_progress(self._sequence_total_seconds())
         self._running = True
         self.start_btn.setEnabled(False)
@@ -4334,7 +4108,8 @@ class MainWindow(QMainWindow):
             COLORS["accent"],
         )
 
-        if self._sequence_index == 0 or self._pause_step_index >= 0:
+        needs_start = self._sequence_index == 0 or self._resuming_after_gaze_pause
+        if needs_start:
             ok = self._apply_sequence_step_params(
                 step,
                 include_static=True,
@@ -4368,6 +4143,7 @@ class MainWindow(QMainWindow):
                     step.dac1_f2,
                 )
             self._send("DBG ON")
+            self._resuming_after_gaze_pause = False
         else:
             if not self._apply_sequence_step_params(step, include_static=False):
                 self._abort_sequence("serial-порт не подключен")
@@ -4406,6 +4182,7 @@ class MainWindow(QMainWindow):
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
         self._paused_by_gaze = False
+        self._resuming_after_gaze_pause = False
         self.start_btn.setEnabled(self.serial.is_open)
         self.stop_btn.setEnabled(False)
         self.sequence_load_btn.setEnabled(True)
@@ -4419,6 +4196,7 @@ class MainWindow(QMainWindow):
         self._pause_remaining_seconds = 0.0
         self._sequence_override_seconds = None
         self._paused_by_gaze = False
+        self._resuming_after_gaze_pause = False
         if self._waiting_gaze_center:
             self._waiting_gaze_center = False
             self._log("Автостарт после калибровки отменён.", COLORS["yellow"])

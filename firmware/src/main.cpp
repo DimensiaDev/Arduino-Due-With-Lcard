@@ -13,8 +13,11 @@ static const int CMD_BUF_SIZE = 64;
 static const float ABS_GAIN_MAX = 20.0f;
 static const uint8_t NUM_DACS = 2;
 
-// TCRT5000 (аналоговый вход, см. tcrt5000_test.ino в корне репозитория)
-static const uint8_t IR_PIN = A0;            // ADC0/PA16 — не пересекается с DAC0/DAC1 (PB15/PB16)
+// TCRT5000 x2 (аналоговые входы, см. tcrt5000_test.ino в корне репозитория)
+static const uint8_t NUM_IR_SENSORS = 2;
+// sensor 0 = ПРАВО (A2), sensor 1 = ЛЕВО (A3) — соответствует «лицом к лицу» в UI.
+// A2/A3 не пересекаются с DAC0/DAC1 (PB15/PB16).
+static const uint8_t IR_PIN[NUM_IR_SENSORS] = {A2, A3};
 static const uint8_t IR_AVG_N = 8;           // окно усреднения
 static const uint16_t IR_ADC_MAX = 4095;
 static const float IR_VREF = 3.3f;
@@ -51,17 +54,17 @@ volatile uint32_t g_dbgSamples = 0;
 volatile uint32_t g_isrUs = 0;
 
 volatile bool g_irEnabled = false;
-volatile uint16_t g_irRaw = 0;
-volatile uint16_t g_irMin = IR_ADC_MAX;
-volatile uint16_t g_irMax = 0;
-volatile bool g_irReflect = false;
-volatile uint16_t g_irTh = IR_TH_DEFAULT;
-volatile uint16_t g_irHyst = IR_HY_DEFAULT;
+volatile uint16_t g_irRaw[NUM_IR_SENSORS] = {0, 0};
+volatile uint16_t g_irMin[NUM_IR_SENSORS] = {IR_ADC_MAX, IR_ADC_MAX};
+volatile uint16_t g_irMax[NUM_IR_SENSORS] = {0, 0};
+volatile bool g_irReflect[NUM_IR_SENSORS] = {false, false};
+volatile uint16_t g_irTh[NUM_IR_SENSORS] = {IR_TH_DEFAULT, IR_TH_DEFAULT};
+volatile uint16_t g_irHyst[NUM_IR_SENSORS] = {IR_HY_DEFAULT, IR_HY_DEFAULT};
 
-uint16_t g_irBuf[IR_AVG_N] = {0};
-uint32_t g_irSum = 0;
-uint8_t g_irIdx = 0;
-uint8_t g_irFilled = 0;
+uint16_t g_irBuf[NUM_IR_SENSORS][IR_AVG_N] = {{0}};
+uint32_t g_irSum[NUM_IR_SENSORS] = {0, 0};
+uint8_t g_irIdx[NUM_IR_SENSORS] = {0, 0};
+uint8_t g_irFilled[NUM_IR_SENSORS] = {0, 0};
 
 float clampAmplitude(float a) { return constrain(a, 0.0f, MAX_AMPLITUDE); }
 float clampDC(float dc) { return constrain(dc, 0.0f, MAX_DC); }
@@ -264,45 +267,51 @@ void printDebug() {
 static uint32_t g_lastIrMs = 0;
 
 void pollIR() {
-    uint16_t s = (uint16_t)analogRead(IR_PIN);
+    for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+        // После смены канала АЦП первый отсчёт может быть «грязным»
+        // (заряд УВХ от предыдущего канала) — отбрасываем его.
+        analogRead(IR_PIN[s]);
+        uint16_t v = (uint16_t)analogRead(IR_PIN[s]);
 
-    g_irSum -= g_irBuf[g_irIdx];
-    g_irBuf[g_irIdx] = s;
-    g_irSum += s;
-    g_irIdx = (uint8_t)((g_irIdx + 1) % IR_AVG_N);
-    if (g_irFilled < IR_AVG_N) g_irFilled++;
+        g_irSum[s] -= g_irBuf[s][g_irIdx[s]];
+        g_irBuf[s][g_irIdx[s]] = v;
+        g_irSum[s] += v;
+        g_irIdx[s] = (uint8_t)((g_irIdx[s] + 1) % IR_AVG_N);
+        if (g_irFilled[s] < IR_AVG_N) g_irFilled[s]++;
 
-    uint16_t avg = (uint16_t)(g_irSum / g_irFilled);
-    g_irRaw = avg;
+        uint16_t avg = (uint16_t)(g_irSum[s] / g_irFilled[s]);
+        g_irRaw[s] = avg;
 
-    if (s < g_irMin) g_irMin = s;
-    if (s > g_irMax) g_irMax = s;
+        if (v < g_irMin[s]) g_irMin[s] = v;
+        if (v > g_irMax[s]) g_irMax[s] = v;
 
-    if (!g_irReflect && avg < g_irTh) {
-        g_irReflect = true;
-    } else if (g_irReflect && avg > (uint16_t)(g_irTh + g_irHyst)) {
-        g_irReflect = false;
+        if (!g_irReflect[s] && avg < g_irTh[s]) {
+            g_irReflect[s] = true;
+        } else if (g_irReflect[s] && avg > (uint16_t)(g_irTh[s] + g_irHyst[s])) {
+            g_irReflect[s] = false;
+        }
     }
 }
 
-void emitIR() {
-    uint16_t raw = g_irRaw;
-    uint16_t mn = g_irMin;
-    uint16_t mx = g_irMax;
-    bool refl = g_irReflect;
+void emitIR(uint8_t s) {
+    uint16_t raw = g_irRaw[s];
+    uint16_t mn = g_irMin[s];
+    uint16_t mx = g_irMax[s];
+    bool refl = g_irReflect[s];
 
-    g_irMin = IR_ADC_MAX;
-    g_irMax = 0;
+    g_irMin[s] = IR_ADC_MAX;
+    g_irMax[s] = 0;
 
     float volts = raw * IR_VREF / (float)IR_ADC_MAX;
 
     Serial.print("{\"ir\":1");
+    Serial.print(",\"sensor\":"); Serial.print(s);
     Serial.print(",\"raw\":"); Serial.print(raw);
     Serial.print(",\"v\":"); Serial.print(volts, 3);
     Serial.print(",\"min\":"); Serial.print(mn);
     Serial.print(",\"max\":"); Serial.print(mx);
     Serial.print(",\"ref\":"); Serial.print(refl ? 1 : 0);
-    Serial.print(",\"th\":"); Serial.print(g_irTh);
+    Serial.print(",\"th\":"); Serial.print(g_irTh[s]);
     Serial.println("}");
 }
 
@@ -311,7 +320,9 @@ void printIR() {
     uint32_t now = millis();
     if (now - g_lastIrMs < 100) return;
     g_lastIrMs = now;
-    emitIR();
+    for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+        emitIR(s);
+    }
 }
 
 char g_cmdBuf[CMD_BUF_SIZE];
@@ -327,6 +338,21 @@ void setChannelFrequency(uint8_t channel, uint8_t slot, float value) {
     }
     recomputeIncrements(channel);
     g_running = wasRunning;
+}
+
+// Разбор суффикса ключа IRTH/IRHY: "" — оба датчика, "0"/"1" — конкретный.
+static bool parseIrSensors(const char *suffix, uint8_t *sel, uint8_t &n) {
+    if (suffix[0] == '\0') {
+        for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) sel[s] = s;
+        n = NUM_IR_SENSORS;
+        return true;
+    }
+    if (suffix[0] >= '0' && suffix[0] < '0' + NUM_IR_SENSORS && suffix[1] == '\0') {
+        sel[0] = (uint8_t)(suffix[0] - '0');
+        n = 1;
+        return true;
+    }
+    return false;
 }
 
 void processCommand(const char *cmd) {
@@ -382,7 +408,7 @@ void processCommand(const char *cmd) {
     }
 
     if (strncmp(cmd, "IR?", 3) == 0) {
-        emitIR();
+        for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) emitIR(s);
         return;
     }
 
@@ -429,12 +455,30 @@ void processCommand(const char *cmd) {
             if (val > ABS_GAIN_MAX) val = ABS_GAIN_MAX;
             g_gainMax = val;
             Serial.print("OK GM="); Serial.println(g_gainMax, 4);
-        } else if (strcmp(key, "IRTH") == 0) {
-            g_irTh = (uint16_t)constrain(val, 0.0f, (float)IR_ADC_MAX);
-            Serial.print("OK IRTH="); Serial.println(g_irTh);
-        } else if (strcmp(key, "IRHY") == 0) {
-            g_irHyst = (uint16_t)constrain(val, 0.0f, 1000.0f);
-            Serial.print("OK IRHY="); Serial.println(g_irHyst);
+        } else if (strncmp(key, "IRTH", 4) == 0) {
+            uint8_t sel[NUM_IR_SENSORS];
+            uint8_t n;
+            if (parseIrSensors(key + 4, sel, n)) {
+                uint16_t v = (uint16_t)constrain(val, 0.0f, (float)IR_ADC_MAX);
+                for (uint8_t i = 0; i < n; ++i) g_irTh[sel[i]] = v;
+                Serial.print("OK IRTH");
+                if (n == 1) Serial.print((char)('0' + sel[0]));
+                Serial.print("="); Serial.println(v);
+            } else {
+                Serial.print("ERR unknown key: "); Serial.println(key);
+            }
+        } else if (strncmp(key, "IRHY", 4) == 0) {
+            uint8_t sel[NUM_IR_SENSORS];
+            uint8_t n;
+            if (parseIrSensors(key + 4, sel, n)) {
+                uint16_t v = (uint16_t)constrain(val, 0.0f, 1000.0f);
+                for (uint8_t i = 0; i < n; ++i) g_irHyst[sel[i]] = v;
+                Serial.print("OK IRHY");
+                if (n == 1) Serial.print((char)('0' + sel[0]));
+                Serial.print("="); Serial.println(v);
+            } else {
+                Serial.print("ERR unknown key: "); Serial.println(key);
+            }
         } else if (strcmp(key, "SR") == 0) {
             bool wasRunning = g_running;
             g_running = false;
@@ -474,12 +518,14 @@ void setup() {
     setupTimer(g_sampleRate);
 
     analogReadResolution(12);
-    pinMode(IR_PIN, INPUT);
+    for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+        pinMode(IR_PIN[s], INPUT);
+    }
 
     NVIC_SetPriority(UART_IRQn, 0);
     NVIC_SetPriority(TC6_IRQn, 1);
 
-    Serial.println("READY dual_dac_sine v4.1 (ir tcrt5000)");
+    Serial.println("READY dual_dac_sine v4.2 (ir tcrt5000 x2: A2/A3)");
 }
 
 void loop() {
