@@ -1091,6 +1091,9 @@ class MainWindow(QMainWindow):
         # Ожидание возврата взгляда в центр после калибровки: эксперимент
         # стартует автоматически, как только оба датчика увидят центр.
         self._waiting_gaze_center = False
+        # Одноразовый обход проверки взгляда: пользователь нажал «Старт»
+        # повторно, пока приложение ждало возврата взгляда в центр.
+        self._start_now_once = False
         self._calibration_samples = [
             {"sensor0": [], "sensor1": []},
             {"sensor0": [], "sensor1": []},
@@ -4050,12 +4053,15 @@ class MainWindow(QMainWindow):
             self._log("Калибровка уже выполняется.", COLORS["yellow"])
             return
         if self._waiting_gaze_center:
+            # Повторное нажатие «Старт» — не ждём взгляда бесконечно:
+            # отменяем ожидание и запускаемся сразу (один раз).
+            self._waiting_gaze_center = False
+            self._start_now_once = True
             self._log(
-                "Старт уже ожидает возврата взгляда в центр — "
-                "эксперимент начнётся автоматически.",
+                "Ожидание возврата взгляда в центр отменено — "
+                "старт по кнопке «Старт».",
                 COLORS["yellow"],
             )
-            return
         if not self.serial.is_open:
             self._log("Нельзя начать: нет подключения к Arduino.", COLORS["red"])
             self.status_bar.showMessage("Подключитесь к Arduino перед стартом")
@@ -4079,7 +4085,10 @@ class MainWindow(QMainWindow):
 
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда."""
-        if self._gaze_off and not self._ignore_gaze():
+        # Одноразовый обход проверки взгляда (повторное нажатие «Старт»).
+        force_gaze = self._start_now_once
+        self._start_now_once = False
+        if self._gaze_off and not self._ignore_gaze() and not force_gaze:
             # Последняя фаза калибровки — «ВПРАВО»: взгляд ещё не успел
             # вернуться в центр. Не считаем это ошибкой — ждём возврата
             # взгляда и стартуем автоматически.
@@ -4099,7 +4108,7 @@ class MainWindow(QMainWindow):
             return
 
         if self.sequence_steps:
-            self._start_sequence()
+            self._start_sequence(force_gaze=force_gaze)
             return
 
         if not self._validate_lsl_recording_ready():
@@ -4134,7 +4143,7 @@ class MainWindow(QMainWindow):
         else:
             self.start_btn.setEnabled(self.serial.is_open)
 
-    def _start_sequence(self):
+    def _start_sequence(self, force_gaze: bool = False):
         if not self.serial.is_open or not self.sequence_steps:
             self._log(
                 "Старт последовательности невозможен: нет подключения к Arduino "
@@ -4143,7 +4152,7 @@ class MainWindow(QMainWindow):
             )
             self.start_btn.setEnabled(self.serial.is_open)
             return
-        if self._gaze_off and not self._ignore_gaze():
+        if self._gaze_off and not self._ignore_gaze() and not force_gaze:
             self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
             self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
             self.start_btn.setEnabled(self.serial.is_open)
@@ -4282,33 +4291,61 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"Последовательность прервана: {reason}")
 
     def _stop(self, checked=False, export: bool = True, reason: str = "Остановлено"):
-        self._sequence_timer.stop()
-        self._auto_apply_timer.stop()
-        self._pause_step_index = -1
-        self._pause_remaining_seconds = 0.0
-        self._sequence_override_seconds = None
-        self._paused_by_gaze = False
-        self._resuming_after_gaze_pause = False
-        if self._waiting_gaze_center:
+        try:
+            self._sequence_timer.stop()
+            self._auto_apply_timer.stop()
+            self._pause_step_index = -1
+            self._pause_remaining_seconds = 0.0
+            self._sequence_override_seconds = None
+            self._paused_by_gaze = False
+            self._resuming_after_gaze_pause = False
+            if self._calibration_in_progress:
+                # Стоп прерывает и калибровку: иначе флаг остаётся включённым
+                # и все следующие «Старт» молча упираются в «Калибровка уже
+                # выполняется» до перезапуска программы.
+                self._calibration_in_progress = False
+                self._calibration_phase_collecting = False
+                self._calibration_after = None
+                self._log("Калибровка прервана остановкой.", COLORS["yellow"])
+            if self._waiting_gaze_center:
+                self._waiting_gaze_center = False
+                self._log("Автостарт после калибровки отменён.", COLORS["yellow"])
+            if self.sequence_steps:
+                self._stop_sequence_progress()
+            self._log("→ STOP", COLORS["red"])
+            if self.serial.is_open:
+                self._send("STOP")
+            if self._recording_active or self.lsl_worker is not None:
+                self._stop_lsl_recording(export=export)
+        except Exception as e:
+            # Остановка проходит всегда: сбой экспорта/воркера/сериала не должен
+            # блокировать запуск следующего эксперимента.
+            self._log(f"Ошибка при остановке: {e}", COLORS["red"])
+            self.status_bar.showMessage(f"Ошибка при остановке: {e}")
+            self.lsl_worker = None
+            self._recording_active = False
+        finally:
+            # Гарантированный сброс состояния — даже если что-то выше упало.
+            self._running = False
+            self._paused_by_gaze = False
+            self._resuming_after_gaze_pause = False
+            self._calibration_in_progress = False
+            self._calibration_phase_collecting = False
+            self._calibration_after = None
             self._waiting_gaze_center = False
-            self._log("Автостарт после калибровки отменён.", COLORS["yellow"])
-        if self.sequence_steps:
-            self._stop_sequence_progress()
-        self._log("→ STOP", COLORS["red"])
-        if self.serial.is_open:
-            self._send("STOP")
-        if self._recording_active or self.lsl_worker is not None:
-            self._stop_lsl_recording(export=export)
-        self._running = False
-        self._sequence_index = 0
-        self.start_btn.setEnabled(self.serial.is_open)
-        self.stop_btn.setEnabled(False)
-        self.sequence_load_btn.setEnabled(True)
-        self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
-        self.status_bar.showMessage(f"■ {reason}")
-        self._log(f"■ {reason}", COLORS["red"])
-        if self.serial.is_open:
-            self._send("DBG OFF")
+            self._start_now_once = False
+            self._sequence_index = 0
+            self.start_btn.setEnabled(self.serial.is_open)
+            self.stop_btn.setEnabled(False)
+            self.sequence_load_btn.setEnabled(True)
+            self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
+            self.status_bar.showMessage(f"■ {reason}")
+            self._log(f"■ {reason}", COLORS["red"])
+            try:
+                if self.serial.is_open:
+                    self._send("DBG OFF")
+            except Exception:
+                pass
 
     # ── Connected slot ────────────────────────────────────────────────────────
     @Slot(bool)
