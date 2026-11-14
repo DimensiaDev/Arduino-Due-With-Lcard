@@ -475,9 +475,18 @@ class SerialWorker(QObject):
                 deadline = time.time() + 0.3
                 while time.time() < deadline:
                     line = self._port.readline().decode(errors="replace").strip()
-                    if line:
+                    if not line:
+                        continue
+                    # Телеметрия прошивки ({"dbg":…}, {"ir":…}, {"status":…})
+                    # идёт каждые 100 мс и может прийти раньше ответа на
+                    # команду. Это НЕ ответ — показываем её в журнале и ждём
+                    # дальше, иначе команда «START» ложно считается
+                    # неподтверждённой и эксперимент прерывается.
+                    if line.startswith("{"):
                         self.message_received.emit(f"← {line}")
-                        return line
+                        continue
+                    self.message_received.emit(f"← {line}")
+                    return line
                 return None
             except Exception as e:
                 self.error_occurred.emit(str(e))
@@ -1094,6 +1103,9 @@ class MainWindow(QMainWindow):
         # Одноразовый обход проверки взгляда: пользователь нажал «Старт»
         # повторно, пока приложение ждало возврата взгляда в центр.
         self._start_now_once = False
+        # Пауза по взгляду не срабатывает сразу после возобновления:
+        # в окне медианы ещё могут быть старые отсчёты «смещённого» взгляда.
+        self._gaze_pause_block_until = 0.0
         self._calibration_samples = [
             {"sensor0": [], "sensor1": []},
             {"sensor0": [], "sensor1": []},
@@ -2761,7 +2773,10 @@ class MainWindow(QMainWindow):
             if not new_off:
                 self._resume_experiment()
         elif self._running and new_off:
-            self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
+            # Небольшая пауза-«антидребезг» сразу после возобновления:
+            # старые отсчёты в медиане не должны мгновенно ставить паузу.
+            if time.monotonic() >= self._gaze_pause_block_until:
+                self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
 
         # Ожидание старта после калибровки: взгляд вернулся в центр — запускаем.
         if (
@@ -3264,6 +3279,13 @@ class MainWindow(QMainWindow):
         self._paused_by_gaze = False
         self._running = True
         self._resuming_after_gaze_pause = True
+        # В окне медианы ещё лежат отсчёты «смещённого» взгляда — очищаем,
+        # чтобы первые пакеты после возобновления не поставили паузу снова.
+        with self._ir_lock:
+            for history in self._ir_raw_history:
+                history.clear()
+        self._sensor_eye_pending = [None, None]
+        self._gaze_pause_block_until = time.monotonic() + 0.5
         self._log("▶ Возобновление эксперимента.", COLORS["green"])
         self.status_bar.showMessage("▶ Возобновление")
 
@@ -4144,7 +4166,12 @@ class MainWindow(QMainWindow):
             return
         time.sleep(0.05)
         self._log("→ START", COLORS["green"])
-        resp = self._send("START")
+        # До двух попыток: ответ может потеряться в потоке телеметрии.
+        resp = None
+        for _attempt in range(2):
+            resp = self._send("START")
+            if resp and "OK" in resp:
+                break
         if resp and "OK" in resp:
             p = self._get_params()
             if not self._begin_lsl_recording(
@@ -4244,7 +4271,14 @@ class MainWindow(QMainWindow):
                 return
             time.sleep(0.05)
             self._log("→ START", COLORS["green"])
-            resp = self._send("START")
+            # Ответ на START мог потеряться в потоке телеметрии — пробуем
+            # ещё раз, прежде чем прерывать эксперимент. Повторный START
+            # безопасен: прошивка просто перезапустит генерацию.
+            resp = None
+            for _attempt in range(2):
+                resp = self._send("START")
+                if resp and "OK" in resp:
+                    break
             if not resp or "OK" not in resp:
                 self._abort_sequence("команда START не подтверждена")
                 return
