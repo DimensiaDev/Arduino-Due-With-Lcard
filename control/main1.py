@@ -2742,16 +2742,23 @@ class MainWindow(QMainWindow):
             self._current_gaze_pos = new_pos
             self._gaze_off = new_off
             self._set_gaze_indicator_style(new_pos)
-            if self._running:
-                # «Игнорировать направление взгляда»: отклонение не ставит
-                # эксперимент на паузу.
-                if new_off and not old_off and not self._ignore_gaze():
-                    self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
-            elif self._paused_by_gaze:
-                # Пауза по взгляду снимается либо при возврате взгляда в центр,
-                # либо сразу, если включили «игнорировать направление взгляда».
-                if self._ignore_gaze() or (not new_off and old_off):
-                    self._resume_experiment()
+
+        # ── Управление экспериментом по взгляду (уровневая логика) ───────
+        # Решение принимается по текущему уровню, а не только по фронту
+        # перехода: если пакет с переходом потерялся или состояние успело
+        # обновиться, пауза не «залипает». Пауза ставится, пока эксперимент
+        # идёт и взгляд смещён; снимается, как только взгляд вернулся в центр
+        # (и продолжается с того же места последовательности).
+        if self._ignore_gaze():
+            # «Игнорировать направление взгляда»: отклонение не ставит на
+            # паузу, а уже стоящая пауза по взгляду снимается.
+            if self._paused_by_gaze:
+                self._resume_experiment()
+        elif self._paused_by_gaze:
+            if not new_off:
+                self._resume_experiment()
+        elif self._running and new_off:
+            self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
 
         # Ожидание старта после калибровки: взгляд вернулся в центр — запускаем.
         if (
