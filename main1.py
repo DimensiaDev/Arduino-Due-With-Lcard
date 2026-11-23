@@ -15,6 +15,7 @@ import math
 import re
 import time
 import threading
+import socket
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -158,6 +159,16 @@ GAZE_FALLBACK_SIGMA = 3.0
 # Прошивка шлёт данные каждые 100 мс, поэтому 3 с — это ~30 пропущенных
 # пакетов: надёжно ловит отключение и не срабатывает от кратких подвисаний UI.
 IR_STALE_SECONDS = 3.0
+
+# ── Поиск LSL-потоков ────────────────────────────────────────────────────────
+# Neuron Spectrum (ЭНЦ, подключение по кабелю) публикует поток по LSL и отвечает
+# на multicast-запрос не мгновенно: односекундного окна resolve_streams не
+# хватало, и поток устройства просто не появлялся в списке (локальный моковый
+# генератор при этом виден сразу — он рядом, ответ приходит мгновенно).
+LSL_RESOLVE_WAIT = 2.5        # окно ожидания ответа на один запрос, с
+LSL_RESOLVE_ATTEMPTS = 3      # сколько раз подряд повторяем поиск (кнопка)
+LSL_RESOLVE_WAIT_BG = 1.5     # окно ожидания при фоновом поиске, с
+LSL_AUTO_REFRESH_MS = 5000    # фоновое обновление списка потоков, мс
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 COLORS = {
@@ -1108,6 +1119,8 @@ class GazeEyesWidget(QWidget):
 class MainWindow(QMainWindow):
     _console_append = Signal(str, str)
     _lsl_worker_error = Signal(str)
+    # Результат фонового поиска LSL-потоков: (список потоков, вручную ли)
+    _lsl_streams_found = Signal(object, bool)
 
     def __init__(self):
         super().__init__()
@@ -1120,6 +1133,7 @@ class MainWindow(QMainWindow):
         self.serial.message_received.connect(self._log_rx)
         self._console_append.connect(self._append_console)
         self._lsl_worker_error.connect(self._on_lsl_worker_error)
+        self._lsl_streams_found.connect(self._on_lsl_streams_found)
         self._running = False
         self.sequence_steps: list[SequenceStep] = []
         self.sequence_file_path: str | None = None
@@ -1141,20 +1155,12 @@ class MainWindow(QMainWindow):
         # преждевременного перехода этапа, если таймер сработал раньше.
         self._sequence_stage_deadline: float | None = None
 
-        # ── Pause-by-gaze state ─────────────────────────────────────────────
-        self._paused_by_gaze = False
-        # Эксперимент уже дошёл до конца: возобновление по взгляду не должно
-        # перезапускать его (иначе приложение снова просит сохранить результаты).
-        self._experiment_finished = False
+        # ── Взгляд: только индикация и запись в файл ────────────────────────
+        # Отведение взгляда НЕ ставит эксперимент на паузу и не блокирует
+        # старт: направление взгляда — справочная величина для разметки
+        # данных, а не условие проведения эксперимента.
         self._gaze_off = False
         self._current_gaze_pos = "forward"
-        self._pause_step_index = -1
-        self._pause_remaining_seconds = 0.0
-        self._sequence_override_seconds = None
-        self._resuming_after_gaze_pause = False
-        # Момент начала паузы: на него сдвигается общий таймер эксперимента,
-        # чтобы после долгой паузы не показывалось «Эксперимент: осталось 00:00».
-        self._pause_started_at: float | None = None
 
         # ── IR sensors ──────────────────────────────────────────────────────
         self._ir_lock = threading.Lock()
@@ -1192,15 +1198,6 @@ class MainWindow(QMainWindow):
         self._calibration_after = None
         # Повторы проблемной фазы калибровки (дрожание / мало отсчётов).
         self._calibration_retries = 0
-        # Ожидание возврата взгляда в центр после калибровки: эксперимент
-        # стартует автоматически, как только оба датчика увидят центр.
-        self._waiting_gaze_center = False
-        # Одноразовый обход проверки взгляда: пользователь нажал «Старт»
-        # повторно, пока приложение ждало возврата взгляда в центр.
-        self._start_now_once = False
-        # Пауза по взгляду не срабатывает сразу после возобновления:
-        # в окне медианы ещё могут быть старые отсчёты «смещённого» взгляда.
-        self._gaze_pause_block_until = 0.0
         self._calibration_samples = [
             {"sensor0": [], "sensor1": []},
             {"sensor0": [], "sensor1": []},
@@ -1216,6 +1213,11 @@ class MainWindow(QMainWindow):
         self.lsl_inlet = None
         self.lsl_stream_meta: dict = {}
         self.lsl_channel_names: list[str] = []
+        # Поиск потоков идёт в отдельном потоке (resolve_streams блокирует на
+        # всё окно ожидания), результат возвращается в GUI через сигнал.
+        self._lsl_resolving = False
+        self._lsl_auto_connect = True
+        self._lsl_hint_logged = False
         self.lsl_worker: LSLRecordingWorker | None = None
         self.lsl_samples: list[dict] = []
         self.lsl_sample_lock = threading.Lock()
@@ -1242,6 +1244,9 @@ class MainWindow(QMainWindow):
         self._recording_active = False
         self._record_start_app_time: float | None = None
         self._record_end_app_time: float | None = None
+        # Калибровка датчиков на момент старта записи — она попадает в
+        # начало файла эксперимента (блок # CALIBRATION).
+        self._record_calibration: dict = {}
 
         self._build_ui()
 
@@ -1256,6 +1261,13 @@ class MainWindow(QMainWindow):
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain_serial)
         self._drain_timer.start(50)
+
+        # Фоновый поиск LSL-потоков: устройство публикует поток в начале
+        # сеанса, и ждать нажатия «Обновить» не нужно.
+        self._lsl_auto_timer = QTimer(self)
+        self._lsl_auto_timer.setInterval(LSL_AUTO_REFRESH_MS)
+        self._lsl_auto_timer.timeout.connect(self._auto_refresh_lsl_streams)
+        self._lsl_auto_timer.start()
 
         self._total_clip_hi = [0, 0]
         self._total_clip_lo = [0, 0]
@@ -1432,6 +1444,7 @@ class MainWindow(QMainWindow):
         self.lsl_stream_combo = QComboBox()
         self.lsl_stream_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.lsl_stream_combo.currentIndexChanged.connect(self._on_lsl_combo_changed)
+        self.lsl_stream_combo.addItem("(ищем LSL-потоки…)")
 
         self.lsl_connect_check = QCheckBox()
         self.lsl_connect_check.setObjectName("lsl_status")
@@ -1538,12 +1551,14 @@ class MainWindow(QMainWindow):
         v.addWidget(self._build_ir_panel())
 
         gaze_box, gaze_layout = self._make_subcard("Взгляд", COLORS["accent2"])
-        self.ignore_gaze_check = QCheckBox("Игнорировать направление взгляда")
-        self.ignore_gaze_check.setToolTip(
-            "Отклонение взгляда не ставит эксперимент на паузу и не блокирует Старт.\n"
-            "Индикатор глаз продолжает показывать реальное состояние датчиков."
+        gaze_hint = QLabel(
+            "Отведение взгляда не прерывает эксперимент: направление взгляда "
+            "показывается в индикаторе и пишется в файл эксперимента "
+            "(колонки LEFT/RIGHT)."
         )
-        gaze_layout.addWidget(self.ignore_gaze_check)
+        gaze_hint.setObjectName("hint_label")
+        gaze_hint.setWordWrap(True)
+        gaze_layout.addWidget(gaze_hint)
 
         self.skip_calibration_check = QCheckBox("Пропустить калибровку")
         self.skip_calibration_check.setToolTip(
@@ -1554,13 +1569,9 @@ class MainWindow(QMainWindow):
         gaze_layout.addWidget(self.skip_calibration_check)
 
         # Состояние флажков переживает перезапуск приложения.
-        self.ignore_gaze_check.setChecked(
-            bool(self.settings.value("service/ignore_gaze", False, type=bool))
-        )
         self.skip_calibration_check.setChecked(
             bool(self.settings.value("service/skip_calibration", False, type=bool))
         )
-        self.ignore_gaze_check.toggled.connect(self._on_ignore_gaze_toggled)
         self.skip_calibration_check.toggled.connect(self._on_skip_calibration_toggled)
         v.addWidget(gaze_box)
 
@@ -1569,22 +1580,11 @@ class MainWindow(QMainWindow):
         v.addWidget(console_box, 1)
         return w
 
-    def _ignore_gaze(self) -> bool:
-        return hasattr(self, "ignore_gaze_check") and self.ignore_gaze_check.isChecked()
-
     def _skip_calibration(self) -> bool:
         return (
             hasattr(self, "skip_calibration_check")
             and self.skip_calibration_check.isChecked()
         )
-
-    def _on_ignore_gaze_toggled(self, checked: bool):
-        self.settings.setValue("service/ignore_gaze", bool(checked))
-        # Если эксперимент уже стоит на паузе по взгляду — снимаем её сразу:
-        # раз взгляд игнорируется, ждать возврата в центр бессмысленно.
-        if checked and self._paused_by_gaze:
-            self._log("Взгляд игнорируется — пауза по взгляду снимается.", COLORS["yellow"])
-            self._resume_experiment()
 
     def _on_skip_calibration_toggled(self, checked: bool):
         self.settings.setValue("service/skip_calibration", bool(checked))
@@ -1926,16 +1926,26 @@ class MainWindow(QMainWindow):
             return
         meta = self._read_lsl_stream_meta(self.lsl_streams[idx])
         self.settings.setValue("lsl/stream_key", self._lsl_stream_key_from_meta(meta))
+        # Устойчивый ключ (тип + префикс имени): устройство пересоздаёт поток
+        # в каждом сеансе, поэтому по одному source_id/uid поток не найти.
+        self.settings.setValue("lsl/stream_pref", self._lsl_stream_pref_key(meta))
 
-    def _restore_lsl_selection(self):
+    def _restore_lsl_selection(self) -> int:
+        """Восстанавливает выбор потока. Возвращает индекс (или -1)."""
         saved_key = str(self.settings.value("lsl/stream_key", "", type=str))
-        if not saved_key:
-            return
-        for idx, info in enumerate(self.lsl_streams):
-            meta = self._read_lsl_stream_meta(info)
-            if self._lsl_stream_key_from_meta(meta) == saved_key:
-                self.lsl_stream_combo.setCurrentIndex(idx)
-                return
+        if saved_key:
+            for idx, info in enumerate(self.lsl_streams):
+                meta = self._read_lsl_stream_meta(info)
+                if self._lsl_stream_key_from_meta(meta) == saved_key:
+                    self.lsl_stream_combo.setCurrentIndex(idx)
+                    return idx
+        # Не нашлось точного — ищем «похожий» (тот же тип и префикс имени).
+        idx = self._find_lsl_by_pref(
+            str(self.settings.value("lsl/stream_pref", "", type=str))
+        )
+        if idx >= 0:
+            self.lsl_stream_combo.setCurrentIndex(idx)
+        return idx
 
     def _attempt_initial_connections(self):
         if not self.serial.is_open and self._valid_serial_port_selected():
@@ -1979,44 +1989,224 @@ class MainWindow(QMainWindow):
             self._set_serial_checkbox(False)
 
     # ── LSL helpers ──────────────────────────────────────────────────────────
-    def _refresh_lsl_streams(self):
-        self.lsl_stream_combo.clear()
-        self.lsl_streams = []
+    def _refresh_lsl_streams(self, user_initiated: bool = True):
+        """Ищет LSL-потоки (в отдельном потоке, GUI не замирает).
+
+        Поиск делаем терпеливым: удалённое устройство (Neuron Spectrum по
+        кабелю) отвечает на multicast-запрос не мгновенно, поэтому одного
+        окна в 1 с не хватало — поток устройства не появлялся в списке, хотя
+        локальный моковый генератор был виден сразу.
+        """
+        if self._lsl_resolving:
+            return
 
         if resolve_streams is None:
             msg = f"pylsl недоступен: {LSL_IMPORT_ERROR}"
+            self.lsl_stream_combo.clear()
             self.lsl_stream_combo.addItem("(pylsl недоступен)")
             self.lsl_status_label.setText(msg)
+            self._log(msg, COLORS["red"])
             self._set_lsl_checkbox(False, enabled=False)
             return
 
-        try:
+        self._lsl_resolving = True
+        if user_initiated:
             self.lsl_status_label.setText("Поиск LSL-потоков...")
             QApplication.processEvents()
-            self.lsl_streams = resolve_streams(wait_time=1.0)
-        except Exception as e:
-            self.lsl_status_label.setText(f"Ошибка обновления LSL: {e}")
-            self._log(f"Ошибка обновления LSL: {e}", COLORS["red"])
-            self._set_lsl_checkbox(False, enabled=False)
-            return
+
+        def worker():
+            # Кнопка «Обновить» ищем терпеливо, фоновый поиск — коротким
+            # окном, чтобы не заваливать сеть multicast-запросами.
+            attempts = LSL_RESOLVE_ATTEMPTS if user_initiated else 1
+            wait = LSL_RESOLVE_WAIT if user_initiated else LSL_RESOLVE_WAIT_BG
+            found = []
+            for _attempt in range(attempts):
+                try:
+                    found = resolve_streams(wait_time=wait) or []
+                except Exception:
+                    found = []
+                if found:
+                    break
+            self._lsl_streams_found.emit(found, user_initiated)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(object, bool)
+    def _on_lsl_streams_found(self, streams, user_initiated: bool):
+        """Результат поиска потоков (приходит из фонового потока)."""
+        self._lsl_resolving = False
+
+        # Ключ текущего выбора снимаем ДО обновления списка.
+        prev_pref = self._current_lsl_pref_key()
+
+        self.lsl_streams = list(streams or [])
 
         if not self.lsl_streams:
+            self.lsl_stream_combo.clear()
             self.lsl_stream_combo.addItem("(LSL-потоки не найдены)")
             self.lsl_status_label.setText("LSL-потоки не найдены")
             self._set_lsl_checkbox(False, enabled=False)
+            if self.lsl_inlet is not None:
+                # Поток пропал из сети (устройство остановило публикацию).
+                # Молчать нельзя: запись пойдёт в пустоту, а эксперимент —
+                # в пустые файлы.
+                self._log(
+                    "LSL-поток исчез из сети — устройство перестало публиковать. "
+                    "Запись будет пустой, пока поток не появится снова.",
+                    COLORS["red"],
+                )
+            self._log_lsl_not_found(user_initiated)
             return
 
+        self.lsl_stream_combo.blockSignals(True)
+        self.lsl_stream_combo.clear()
         for info in self.lsl_streams:
             meta = self._read_lsl_stream_meta(info)
             self.lsl_stream_combo.addItem(
                 f"{meta['name']} | {meta['type']} | "
                 f"{meta['channel_count']} кан. | {meta['nominal_srate_hz']} Гц"
             )
-        self._restore_lsl_selection()
+        self.lsl_stream_combo.blockSignals(False)
+
+        # Выбор потока: сначала точный (source_id/uid), затем «похожий» —
+        # Neuron Spectrum пересоздаёт поток в каждом сеансе (в имени дата и
+        # время, uid меняется), поэтому по одному только ключу он никогда не
+        # совпал бы с прошлым сеансом.
+        idx = -1
+        if prev_pref:
+            idx = self._find_lsl_by_pref(prev_pref)
+        if idx < 0:
+            idx = self._find_lsl_by_pref(
+                str(self.settings.value("lsl/stream_pref", "", type=str))
+            )
+        if idx < 0:
+            idx = self._restore_lsl_selection()
+        if idx >= 0 and idx != self.lsl_stream_combo.currentIndex():
+            # Сигналы глушим: переподключением занимаемся сами, ниже.
+            self.lsl_stream_combo.blockSignals(True)
+            self.lsl_stream_combo.setCurrentIndex(idx)
+            self.lsl_stream_combo.blockSignals(False)
+
         self.lsl_status_label.setText(f"Найдено LSL-потоков: {len(self.lsl_streams)}")
         connected = self.lsl_inlet is not None
         self._set_lsl_checkbox(connected, enabled=True)
         self._update_lsl_stream_preview()
+
+        if user_initiated:
+            for info in self.lsl_streams:
+                meta = self._read_lsl_stream_meta(info)
+                self._log(
+                    f"LSL-поток: {meta['name']} | тип {meta['type']} | "
+                    f"{meta['channel_count']} кан. | {meta['nominal_srate_hz']} Гц",
+                    COLORS["text_dim"],
+                )
+
+        # Устройство пересоздало поток (новый сеанс) — переподключаемся на
+        # него, иначе запись пойдёт в мёртвый поток.
+        if self.lsl_inlet is not None:
+            self._reconnect_if_stream_recreated()
+
+        # Поток появился, а мы не подключены — подключаемся сами.
+        if (
+            self.lsl_inlet is None
+            and self._lsl_auto_connect
+            and self._valid_lsl_stream_selected()
+        ):
+            self._connect_selected_lsl_stream()
+
+    def _auto_refresh_lsl_streams(self):
+        """Фоновый поиск: устройство публикует поток в начале сеанса,
+        ждать нажатия «Обновить» не нужно."""
+        if self._lsl_resolving:
+            return
+        self._refresh_lsl_streams(user_initiated=False)
+
+    def _current_lsl_pref_key(self) -> str:
+        """Ключ выбранного потока (устойчивый к пересозданию потока)."""
+        idx = self.lsl_stream_combo.currentIndex()
+        if 0 <= idx < len(self.lsl_streams):
+            meta = self._read_lsl_stream_meta(self.lsl_streams[idx])
+            return self._lsl_stream_pref_key(meta)
+        return ""
+
+    def _lsl_stream_pref_key(self, meta: dict) -> str:
+        """Ключ потока, переживающий пересоздание потока устройством.
+
+        Neuron Spectrum публикует новый поток в каждом сеансе: в имени есть
+        дата и время, source_id/uid тоже меняются. Сравниваем по типу и
+        «префиксу» имени — той части до первой цифры.
+        """
+        name = str(meta.get("name", ""))
+        prefix = name
+        for i, ch in enumerate(name):
+            if ch.isdigit():
+                prefix = name[:i]
+                break
+        return f"{meta.get('type', '')}|{prefix.strip()}"
+
+    def _find_lsl_by_pref(self, pref_key: str) -> int:
+        """Индекс потока с таким устойчивым ключом, -1 если нет."""
+        if not pref_key:
+            return -1
+        for idx, info in enumerate(self.lsl_streams):
+            meta = self._read_lsl_stream_meta(info)
+            if self._lsl_stream_pref_key(meta) == pref_key:
+                return idx
+        return -1
+
+    def _reconnect_if_stream_recreated(self):
+        """Устройство пересоздало поток — переподключаемся к новому."""
+        cur_uid = str(self.lsl_stream_meta.get("uid", ""))
+        uids = {
+            str(self._read_lsl_stream_meta(i).get("uid", ""))
+            for i in self.lsl_streams
+        }
+        if not cur_uid or cur_uid in uids:
+            return
+        pref = self._lsl_stream_pref_key(self.lsl_stream_meta)
+        idx = self._find_lsl_by_pref(pref)
+        if idx < 0:
+            self._log(
+                "LSL-поток исчез из списка — устройство, похоже, остановило "
+                "публикацию.",
+                COLORS["yellow"],
+            )
+            return
+        new_meta = self._read_lsl_stream_meta(self.lsl_streams[idx])
+        self._log(
+            f"Устройство пересоздало поток ({new_meta['name']}) — переподключаемся.",
+            COLORS["yellow"],
+        )
+        self.lsl_stream_combo.setCurrentIndex(idx)
+        self._connect_selected_lsl_stream(idx)
+
+    def _log_lsl_not_found(self, user_initiated: bool):
+        """Подсказка, когда потоки не найдены: на реальном железе это почти
+        всегда сеть или брандмауэр, а не программа."""
+        if self._lsl_hint_logged and not user_initiated:
+            return
+        self._lsl_hint_logged = True
+        self._log(
+            "LSL-потоки не найдены. Проверьте: 1) устройство реально публикует "
+            "поток (запущен ли checkup на Neuron Spectrum); 2) кабель подключён "
+            "и IP устройства в одной подсети с этим компьютером; 3) в брандмауэре "
+            "Windows разрешён Python для частной сети (UDP 11578 и 16572-16579).",
+            COLORS["yellow"],
+        )
+        try:
+            host = socket.gethostname()
+            addrs = sorted({
+                info[4][0]
+                for info in socket.getaddrinfo(host, None, socket.AF_INET)
+            })
+        except Exception:
+            addrs = []
+        if addrs:
+            self._log(
+                "   IP этого компьютера: " + ", ".join(addrs) +
+                " — он должен быть в одной подсети с устройством.",
+                COLORS["text_dim"],
+            )
 
     def _update_lsl_stream_preview(self):
         idx = self.lsl_stream_combo.currentIndex()
@@ -2104,8 +2294,12 @@ class MainWindow(QMainWindow):
 
     def _toggle_lsl_connection(self, checked: bool):
         if checked:
+            self._lsl_auto_connect = True
             self._connect_lsl_stream()
         else:
+            # Пользователь отключил поток руками — автоподключение больше не
+            # срабатывает, пока он снова не включит его.
+            self._lsl_auto_connect = False
             self._disconnect_lsl_stream()
 
     def _set_lsl_checkbox(self, checked: bool, enabled: bool = True):
@@ -2565,13 +2759,9 @@ class MainWindow(QMainWindow):
             bg = "#35171a"
             border = COLORS["red"]
             fg = "#ffe0e0"
-            # При «игнорировать направление взгляда» паузы не будет —
-            # не пугаем пользователя словами про паузу.
-            tail = (
-                " (игнорируется)"
-                if self._ignore_gaze()
-                else "! Скорректируйте взгляд. Эксперимент на паузе."
-            )
+            # Отведение взгляда не прерывает эксперимент — предупреждаем
+            # мягко, без упоминания паузы.
+            tail = " (эксперимент продолжается)"
             if position == "left":
                 text = f"⚠ Взгляд смещён ВЛЕВО{tail}"
             elif position == "right":
@@ -2972,38 +3162,11 @@ class MainWindow(QMainWindow):
             self._gaze_off = new_off
             self._set_gaze_indicator_style(new_pos)
 
-        # ── Управление экспериментом по взгляду (уровневая логика) ───────
-        # Решение принимается по текущему уровню, а не только по фронту
-        # перехода: если пакет с переходом потерялся или состояние успело
-        # обновиться, пауза не «залипает». Пауза ставится, пока эксперимент
-        # идёт и взгляд смещён; снимается, как только взгляд вернулся в центр
-        # (и продолжается с того же места последовательности).
-        if self._ignore_gaze():
-            # «Игнорировать направление взгляда»: отклонение не ставит на
-            # паузу, а уже стоящая пауза по взгляду снимается.
-            if self._paused_by_gaze:
-                self._resume_experiment()
-        elif self._paused_by_gaze:
-            if not new_off:
-                self._resume_experiment()
-        elif self._running and new_off:
-            # Небольшая пауза-«антидребезг» сразу после возобновления:
-            # старые отсчёты в медиане не должны мгновенно ставить паузу.
-            if time.monotonic() >= self._gaze_pause_block_until:
-                self._pause_experiment(reason=f"взгляд {gaze_position_label(new_pos)}")
-
-        # Ожидание старта после калибровки: взгляд вернулся в центр — запускаем.
-        if (
-            self._waiting_gaze_center
-            and not self._gaze_off
-            and not self._running
-            and not self._calibration_in_progress
-        ):
-            self._waiting_gaze_center = False
-            self.stop_btn.setEnabled(False)
-            self._log("Взгляд в центре — запуск эксперимента.", COLORS["green"])
-            QTimer.singleShot(250, self._start_experiment)
-
+        # Взгляд НЕ управляет экспериментом: отведение глаз не ставит
+        # прогон на паузу и не блокирует старт. Направление взгляда —
+        # справочная величина: она попадает в индикатор и в файл
+        # эксперимента (ir_gaze_position, LEFT/RIGHT), где её можно
+        # использовать для разметки данных офлайн.
         self._update_gaze_indicator_with_states(states)
 
     def _get_current_ir(self) -> dict:
@@ -3188,7 +3351,7 @@ class MainWindow(QMainWindow):
             )
             self.status_bar.showMessage("Нет подключения к Arduino для калибровки")
             return False
-        if self._running or self._paused_by_gaze:
+        if self._running:
             self._stop(reason="Калибровка")
 
         self._calibration_after = after
@@ -3216,7 +3379,6 @@ class MainWindow(QMainWindow):
         self._calibration_in_progress = False
         self._calibration_phase_collecting = False
         self._calibration_after = None
-        self._waiting_gaze_center = False
         self.start_btn.setEnabled(self.serial.is_open)
         self.stop_btn.setEnabled(False)
         self._log(f"Калибровка не завершена ({reason}). Эксперимент не запущен.", COLORS["yellow"])
@@ -3455,8 +3617,9 @@ class MainWindow(QMainWindow):
 
         # ── Проверки геометрии калибровки ────────────────────────────────────
         # Ошибка здесь не ломает эксперимент мгновенно, но искажает
-        # классификацию взгляда, а значит — моменты пауз и всю разметку
-        # эксперимента. Поэтому предупреждаем явно.
+        # классификацию взгляда, а значит — разметку данных в файле
+        # эксперимента (LEFT/RIGHT, ir_gaze_position). Поэтому предупреждаем
+        # явно.
         geometry_problems: list[str] = []
 
         # 1. Опорная точка «вперёд» должна лежать между «влево» и «вправо»,
@@ -3534,8 +3697,8 @@ class MainWindow(QMainWindow):
         # была «ВПРАВО», а в окне медианы и в счётчиках дебаунса ещё лежат
         # отсчёты старого положения. Реальную позицию определит свежая
         # телеметрия — иначе приложение считало бы взгляд «вперёд», хотя
-        # пользователь смотрит в сторону: эксперимент стартовал бы с
-        # отведённым взглядом и тут же вставал бы на паузу.
+        # пользователь смотрит в сторону: в файле эксперимента лежала бы
+        # неверная разметка направления взгляда.
         with self._ir_lock:
             for history in self._ir_raw_history:
                 history.clear()
@@ -3584,128 +3747,6 @@ class MainWindow(QMainWindow):
         else:
             self.status_bar.showMessage("Калибровка завершена")
 
-    # ── Pause / resume ───────────────────────────────────────────────────────
-    def _pause_experiment(self, reason: str = "пауза"):
-        if self._paused_by_gaze:
-            return
-        if not self._running:
-            # Эксперимент уже остановлен (или завершён) — пауза по взгляду
-            # не должна его трогать. Иначе возобновление по возврату взгляда
-            # перезапустило бы уже законченный прогон, и приложение снова
-            # просило бы сохранить результаты вместо спокойного завершения.
-            return
-
-        self._paused_by_gaze = True
-        self._resuming_after_gaze_pause = False
-        self._pause_started_at = time.monotonic()
-        self._log(f"⏸ ПАУЗА: {reason}. Отправка STOP.", COLORS["yellow"])
-        self.status_bar.showMessage(f"⏸ Пауза: {reason}")
-
-        if self._running and self.sequence_steps:
-            last_idx = len(self.sequence_steps) - 1
-            if self._sequence_stage_start_time is not None:
-                elapsed = time.monotonic() - self._sequence_stage_start_time
-                self._pause_remaining_seconds = max(
-                    0.0, self._sequence_stage_duration - elapsed
-                )
-                self._pause_step_index = min(
-                    self._sequence_stage_number - 1, last_idx
-                )
-                self._log(
-                    f"   этап {self._sequence_stage_number} приостановлен, "
-                    f"осталось {self._pause_remaining_seconds:.2f} с",
-                    COLORS["yellow"],
-                )
-            else:
-                # Нет данных о начале этапа (гонка на границе этапов):
-                # не теряем этап — продолжаем текущий/последний с его
-                # длительностью. Иначе на возобновлении можно было получить
-                # «индекс за последним этапом» и досрочное завершение.
-                idx = min(max(self._sequence_index - 1, 0), last_idx)
-                self._pause_step_index = idx
-                self._pause_remaining_seconds = float(
-                    self._sequence_stage_duration
-                    or self.sequence_steps[idx].seconds
-                )
-                self._log(
-                    f"   этап {idx + 1} будет повторён с начала "
-                    f"({self._pause_remaining_seconds:.2f} с)",
-                    COLORS["yellow"],
-                )
-
-        self._sequence_stage_deadline = None
-        self._sequence_timer.stop()
-        self._sequence_progress_timer.stop()
-        self._auto_apply_timer.stop()
-        if self.serial.is_open:
-            self._send("STOP")
-        self._running = False
-
-    def _resume_experiment(self):
-        if not self._paused_by_gaze:
-            return
-        if self._experiment_finished:
-            # Эксперимент уже завершён — «возобновление» означало бы его
-            # повторный запуск и ещё одно окно сохранения результатов.
-            self._paused_by_gaze = False
-            self._log(
-                "Эксперимент уже завершён — повторный запуск не выполняется.",
-                COLORS["yellow"],
-            )
-            return
-        self._paused_by_gaze = False
-        self._running = True
-        self._resuming_after_gaze_pause = True
-        # Пауза не должна «съедать» общее время эксперимента: сдвигаем старт
-        # общего таймера на длительность паузы (иначе после долгой паузы
-        # показывается «Эксперимент: осталось 00:00», как будто всё кончилось).
-        if self._pause_started_at is not None and self._sequence_total_start_time is not None:
-            self._sequence_total_start_time += time.monotonic() - self._pause_started_at
-        self._pause_started_at = None
-        # В окне медианы ещё лежат отсчёты «смещённого» взгляда — очищаем,
-        # чтобы первые пакеты после возобновления не поставили паузу снова.
-        with self._ir_lock:
-            for history in self._ir_raw_history:
-                history.clear()
-        self._sensor_eye_pending = [None, None]
-        self._gaze_pause_block_until = time.monotonic() + 0.5
-        self._log("▶ Возобновление эксперимента.", COLORS["green"])
-        self.status_bar.showMessage("▶ Возобновление")
-
-        if self.sequence_steps:
-            last_idx = len(self.sequence_steps) - 1
-            if self._pause_step_index >= 0:
-                # Продолжаем именно приостановленный этап с его остатком;
-                # индекс всегда в допустимых пределах — иначе «завершение
-                # эксперимента» случилось бы раньше последнего этапа.
-                self._sequence_index = min(self._pause_step_index, last_idx)
-                self._sequence_override_seconds = max(
-                    self._pause_remaining_seconds, 0.01
-                )
-                self._log(
-                    f"   продолжаем этап {self._sequence_index + 1}/"
-                    f"{len(self.sequence_steps)} с остатком "
-                    f"{self._sequence_override_seconds:.2f} с",
-                    COLORS["accent"],
-                )
-            else:
-                # Страховка: возобновление НИКОГДА не должно завершать
-                # эксперимент. Если индекс ушёл за последний этап или этап
-                # неизвестен — повторяем текущий/последний этап целиком.
-                idx = min(max(self._sequence_index, 0), last_idx)
-                self._sequence_index = idx
-                self._sequence_override_seconds = float(self.sequence_steps[idx].seconds)
-                self._log(
-                    f"   продолжаем этап {idx + 1}/{len(self.sequence_steps)} "
-                    "с начала (этап паузы не был записан).",
-                    COLORS["yellow"],
-                )
-            self._run_next_sequence_step()
-        else:
-            if self.serial.is_open:
-                self._send("START")
-                self._send("DBG ON")
-
     def _begin_lsl_recording(
         self,
         step_index: int,
@@ -3736,6 +3777,10 @@ class MainWindow(QMainWindow):
         self._record_sequence_steps = list(self.sequence_steps)
         self._record_start_app_time = time.time()
         self._record_end_app_time = None
+        # Снимок калибровки на момент старта записи: в файл эксперимента
+        # попадёт та калибровка, по которой реально шёл прогон, даже если
+        # пользователь перекалибрует датчики позже.
+        self._record_calibration = self._snapshot_calibration()
         self._set_current_stim(step_index, dac0_f1, dac0_f2, dac1_f1, dac1_f2)
 
         try:
@@ -3937,6 +3982,11 @@ class MainWindow(QMainWindow):
             "ir_raw1": [r.get("ir_raw1", np.nan) for r in records],
             "ir_eye0": [r.get("ir_eye0", "forward") for r in records],
             "ir_eye1": [r.get("ir_eye1", "forward") for r in records],
+            # Показания фотодиодов TCRT5000 по сторонам. Нумерация датчиков
+            # везде одна и та же: датчик 0 — ПРАВО (A2), датчик 1 — ЛЕВО (A3)
+            # (так же в прошивке, в UI и в калибровке: s0 = право, s1 = лево).
+            "LEFT": [r.get("ir_raw1", np.nan) for r in records],
+            "RIGHT": [r.get("ir_raw0", np.nan) for r in records],
         }
         for idx, name in enumerate(safe_names):
             data[f"raw_{name}"] = raw[:, idx]
@@ -3980,19 +4030,27 @@ class MainWindow(QMainWindow):
             "serial_baud": 115200,
             "ir_events_json": self._json_value(ir_events_for_export),
             "ir_was_used": bool(any(r.get("ir_available") for r in records)),
-            "ir_calibration_points_json": self._json_value(self.ir_calibration),
+            "ir_calibration_points_json": self._json_value(
+                self._record_calibration or self._snapshot_calibration()
+            ),
             "ir_invert_sensor_raw": bool(INVERT_SENSOR_RAW),
-            "ir_ignore_gaze": bool(self._ignore_gaze()),
+            "ir_gaze_pauses_experiment": False,
             "ir_skip_calibration": bool(self._skip_calibration()),
+            "ir_photodiode_columns": (
+                "LEFT — показания левого фотодиода TCRT5000 (датчик 1, A3); "
+                "RIGHT — правого (датчик 0, A2). Значения — raw АЦП в шкале "
+                "приложения: после инверсии меньше = белок, больше = зрачок. "
+                "Калибровка этих датчиков — в блоке # CALIBRATION в начале файла."
+            ),
             "ir_classification_note": (
                 "ir_gaze_position is classified in Python per sensor (nearest-neighbor "
                 "against ir_calibration_points_json, distances normalized by per-sensor "
                 "sigma from 'scale' when present; sliding-median smoothed input, "
                 "state-change debounce, conjugate-gaze propagation to both eyes). "
-                "'forward' means gaze OK; 'left'/'right'/'off' trigger pause "
-                "unless ir_ignore_gaze is set (then gaze never pauses the "
-                "experiment and does not block start; ir_skip_calibration "
-                "means start skipped gaze calibration). "
+                "'forward' means gaze OK; 'left'/'right'/'off' are informational "
+                "only — gaze deviation NEVER pauses the experiment and does not "
+                "block start. ir_skip_calibration means start skipped gaze "
+                "calibration. "
                 "In default mode (no calibration) deviation uses the per-sensor "
                 "reflect flag. "
                 "Values in ir_* columns are already inverted if ir_invert_sensor_raw=True: "
@@ -4069,10 +4127,66 @@ class MainWindow(QMainWindow):
             return (len(stamps) - 1) / (stamps[-1] - stamps[0])
         return nominal_fs
 
+    def _snapshot_calibration(self) -> dict:
+        """Копия текущей калибровки датчиков (без ссылок на исходный словарь)."""
+        cal = self.ir_calibration if isinstance(self.ir_calibration, dict) else {}
+        snapshot: dict = {}
+        for name, point in cal.items():
+            if not isinstance(point, dict):
+                continue
+            values = {
+                key: float(value)
+                for key, value in point.items()
+                if isinstance(value, (int, float)) and np.isfinite(value)
+            }
+            if values:
+                snapshot[name] = values
+        return snapshot
+
+    def _calibration_export_rows(self) -> list[tuple[str, str, str, float]]:
+        """Строки блока калибровки для начала файла эксперимента.
+
+        Для каждой опорной точки взгляда (влево / вперёд / вправо) — медиана
+        raw по правому (датчик 0, A2) и левому (датчик 1, A3) фотодиодам.
+        Значения — в той же шкале, в которой записаны колонки LEFT/RIGHT
+        (после инверсии: меньше = белок, больше = зрачок).
+        """
+        cal = self._record_calibration
+        if not isinstance(cal, dict) or not cal:
+            cal = self._snapshot_calibration()
+        rows: list[tuple[str, str, str, float]] = []
+        for phase in ("left", "forward", "right"):
+            point = cal.get(phase)
+            if not isinstance(point, dict):
+                continue
+            for side, idx in (("RIGHT", 0), ("LEFT", 1)):
+                value = point.get(f"s{idx}")
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    rows.append((phase, side, str(idx), float(value)))
+        scale = cal.get("scale")
+        if isinstance(scale, dict):
+            # Нормировка датчиков (σ) — по ней классификация считает
+            # отклонение взгляда в долях σ.
+            for side, idx in (("RIGHT", 0), ("LEFT", 1)):
+                value = scale.get(f"s{idx}")
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    rows.append(("sigma", side, str(idx), float(value)))
+        return rows
+
     def _write_txt_export(self, path: str, data_df, metadata_df):
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write("# METADATA\n")
             metadata_df.to_csv(f, sep="\t", index=False, lineterminator="\n")
+            # Калибровка датчиков — в начале файла, до таблицы данных:
+            # по ней сразу видно, в каких единицах записаны LEFT/RIGHT.
+            f.write("\n# CALIBRATION\n")
+            cal_rows = self._calibration_export_rows()
+            if cal_rows:
+                f.write("phase\tside\tsensor\traw\n")
+                for phase, side, sensor, value in cal_rows:
+                    f.write(f"{phase}\t{side}\t{sensor}\t{value:.1f}\n")
+            else:
+                f.write("none\n")
             f.write("\n# DATA\n")
             data_df.to_csv(f, sep="\t", index=False, lineterminator="\n")
 
@@ -4490,39 +4604,14 @@ class MainWindow(QMainWindow):
         if self._calibration_in_progress:
             self._log("Калибровка уже выполняется.", COLORS["yellow"])
             return
-        if self._waiting_gaze_center:
-            # Повторное нажатие «Старт» — не ждём взгляда бесконечно:
-            # отменяем ожидание и запускаемся сразу (один раз).
-            self._waiting_gaze_center = False
-            self._start_now_once = True
-            self._log(
-                "Ожидание возврата взгляда в центр отменено — "
-                "старт по кнопке «Старт».",
-                COLORS["yellow"],
-            )
         if not self.serial.is_open:
             self._log("Нельзя начать: нет подключения к Arduino.", COLORS["red"])
             self.status_bar.showMessage("Подключитесь к Arduino перед стартом")
             return
 
-        # Эксперимент стоит на паузе из-за отведения взгляда: «Старт» должен
-        # ПРОДОЛЖИТЬ его, а не прерывать с окном сохранения результатов.
-        if self._paused_by_gaze and not self._experiment_finished:
-            if self._gaze_off and not self._ignore_gaze():
-                self._log(
-                    "Эксперимент на паузе: дождитесь возврата взгляда в центр "
-                    "— продолжение произойдёт автоматически.",
-                    COLORS["yellow"],
-                )
-                self.status_bar.showMessage("Верните взгляд в центр — продолжение")
-            else:
-                self._log("Продолжаем эксперимент с паузы.", COLORS["green"])
-                self._resume_experiment()
-            return
-
         # Новый эксперимент поверх ещё идущего прогона: сначала
         # корректно завершаем предыдущий (STOP, экспорт записи, сброс
-        # состояния) — иначе его пауза/запись «протекают» в новый.
+        # состояния) — иначе его запись «протекает» в новый.
         if self._running:
             self._stop(reason="Запуск нового эксперимента")
 
@@ -4542,52 +4631,13 @@ class MainWindow(QMainWindow):
         if not self._start_calibration(after=self._start_experiment):
             self.start_btn.setEnabled(self.serial.is_open)
 
-    def _reset_gaze_pause_state(self):
-        """Новый эксперимент не наследует паузу по взгляду от прошлого.
-
-        Если эксперимент остался на паузе (пользователь нажал «Старт», а не
-        «Стоп»), флаг ``_paused_by_gaze`` переживает калибровку и запуск —
-        и тогда уровневая логика в ``_set_current_ir`` навсегда остаётся в
-        ветке «пауза уже стоит»: взгляд виден (индикатор показывает «влево»),
-        но эксперимент не останавливается.
-        """
-        self._paused_by_gaze = False
-        self._resuming_after_gaze_pause = False
-        self._pause_step_index = -1
-        self._pause_remaining_seconds = 0.0
-        self._sequence_override_seconds = None
-        self._pause_started_at = None
-        self._sequence_stage_deadline = None
-        self._experiment_finished = False
-
     def _start_experiment(self):
         """Продолжение старта — вызывается сразу после калибровки взгляда."""
-        # Одноразовый обход проверки взгляда (повторное нажатие «Старт»).
-        force_gaze = self._start_now_once
-        self._start_now_once = False
-        # Чистый старт: никакой паузы/остатков от предыдущего эксперимента.
-        self._reset_gaze_pause_state()
-        if self._gaze_off and not self._ignore_gaze() and not force_gaze:
-            # Последняя фаза калибровки — «ВПРАВО»: взгляд ещё не успел
-            # вернуться в центр. Не считаем это ошибкой — ждём возврата
-            # взгляда и стартуем автоматически.
-            self._waiting_gaze_center = True
-            prefix = (
-                "Калибровка пропущена."
-                if self._skip_calibration()
-                else "Калибровка завершена."
-            )
-            self._log(
-                f"{prefix} Верните взгляд в центр — "
-                "эксперимент стартует автоматически.",
-                COLORS["accent"],
-            )
-            self.status_bar.showMessage("Верните взгляд в центр — эксперимент начнётся автоматически")
-            self.stop_btn.setEnabled(True)  # Стоп отменяет ожидание старта
-            return
+        # Чистый старт: никаких остатков от предыдущего эксперимента.
+        self._sequence_stage_deadline = None
 
         if self.sequence_steps:
-            self._start_sequence(force_gaze=force_gaze)
+            self._start_sequence()
             return
 
         if not self._validate_lsl_recording_ready():
@@ -4658,7 +4708,7 @@ class MainWindow(QMainWindow):
             return None
         return bool(run)
 
-    def _start_sequence(self, force_gaze: bool = False):
+    def _start_sequence(self):
         if not self.serial.is_open or not self.sequence_steps:
             self._log(
                 "Старт последовательности невозможен: нет подключения к Arduino "
@@ -4667,24 +4717,13 @@ class MainWindow(QMainWindow):
             )
             self.start_btn.setEnabled(self.serial.is_open)
             return
-        if self._gaze_off and not self._ignore_gaze() and not force_gaze:
-            self._log("Нельзя начать: взгляд смещён. Скорректируйте взгляд.", COLORS["red"])
-            self.status_bar.showMessage("Скорректируйте взгляд перед стартом")
-            self.start_btn.setEnabled(self.serial.is_open)
-            return
         if not self._validate_lsl_recording_ready():
             self.start_btn.setEnabled(self.serial.is_open)
             return
 
         self._auto_apply_timer.stop()
         self._sequence_index = 0
-        self._pause_step_index = -1
-        self._pause_remaining_seconds = 0.0
-        self._sequence_override_seconds = None
-        self._resuming_after_gaze_pause = False
-        self._pause_started_at = None
         self._sequence_stage_deadline = None
-        self._experiment_finished = False
         self._reset_sequence_progress(self._sequence_total_seconds())
         self._running = True
         self.start_btn.setEnabled(False)
@@ -4730,9 +4769,6 @@ class MainWindow(QMainWindow):
         total = len(self.sequence_steps)
 
         effective_seconds = step.seconds
-        if self._sequence_override_seconds is not None:
-            effective_seconds = self._sequence_override_seconds
-            self._sequence_override_seconds = None
 
         self._log(
             f"[SEQ {step_no}/{total}] "
@@ -4742,7 +4778,7 @@ class MainWindow(QMainWindow):
             COLORS["accent"],
         )
 
-        needs_start = self._sequence_index == 0 or self._resuming_after_gaze_pause
+        needs_start = self._sequence_index == 0
         if needs_start:
             ok = self._apply_sequence_step_params(
                 step,
@@ -4781,7 +4817,6 @@ class MainWindow(QMainWindow):
                     step.dac1_f2,
                 )
             self._send("DBG ON")
-            self._resuming_after_gaze_pause = False
         else:
             if not self._apply_sequence_step_params(step, include_static=False):
                 self._abort_sequence("serial-порт не подключен")
@@ -4794,25 +4829,19 @@ class MainWindow(QMainWindow):
                 step.dac1_f2,
             )
 
-        self._pause_step_index = -1
         self._begin_sequence_stage_progress(step_no, total, effective_seconds)
         self._sequence_index += 1
         self._sequence_stage_deadline = time.monotonic() + float(effective_seconds)
         self._sequence_timer.start(max(1, int(effective_seconds * 1000)))
 
     def _finish_sequence(self):
-        # Эксперимент завершён: помечаем ДО остановки, потому что остановка
-        # открывает модальное окно сохранения, в котором крутится цикл
-        # событий — логика взгляда не должна успеть «возобновить» прогон.
-        self._experiment_finished = True
         self._log("Последовательность завершена.", COLORS["green"])
         self._stop()
         self._finish_sequence_progress()
         self.status_bar.showMessage("Последовательность завершена")
 
     def _abort_sequence(self, reason: str):
-        # Эксперимент прерван: снимаем «идёт» до модального окна экспорта,
-        # чтобы логика взгляда не перезапустила прерванный прогон.
+        # Эксперимент прерван: освобождаем кнопки и сохраняем запись.
         self._running = False
         self._log(f"Последовательность прервана: {reason}.", COLORS["red"])
         self._sequence_timer.stop()
@@ -4824,12 +4853,6 @@ class MainWindow(QMainWindow):
             self._stop_lsl_recording(export=True)
         self._running = False
         self._sequence_index = 0
-        self._pause_step_index = -1
-        self._pause_remaining_seconds = 0.0
-        self._sequence_override_seconds = None
-        self._paused_by_gaze = False
-        self._resuming_after_gaze_pause = False
-        self._pause_started_at = None
         self._sequence_stage_deadline = None
         self.start_btn.setEnabled(self.serial.is_open)
         self.stop_btn.setEnabled(False)
@@ -4840,18 +4863,13 @@ class MainWindow(QMainWindow):
     def _stop(self, checked=False, export: bool = True, reason: str = "Остановлено"):
         # Прогон считается остановленным СРАЗУ, до модального окна
         # сохранения: окно живёт в отдельном цикле событий, и пока флаг
-        # «идёт» стоял, логика взгляда успевала поставить паузу и затем
-        # возобновить уже завершённый эксперимент — приложение снова и
-        # снова просило сохранить результаты вместо завершения.
+        # «идёт» стоял, логика взгляда успевала вмешаться в завершение
+        # прогона — приложение снова и снова просило сохранить результаты
+        # вместо спокойного завершения.
         self._running = False
         try:
             self._sequence_timer.stop()
             self._auto_apply_timer.stop()
-            self._pause_step_index = -1
-            self._pause_remaining_seconds = 0.0
-            self._sequence_override_seconds = None
-            self._paused_by_gaze = False
-            self._resuming_after_gaze_pause = False
             if self._calibration_in_progress:
                 # Стоп прерывает и калибровку: иначе флаг остаётся включённым
                 # и все следующие «Старт» молча упираются в «Калибровка уже
@@ -4860,9 +4878,6 @@ class MainWindow(QMainWindow):
                 self._calibration_phase_collecting = False
                 self._calibration_after = None
                 self._log("Калибровка прервана остановкой.", COLORS["yellow"])
-            if self._waiting_gaze_center:
-                self._waiting_gaze_center = False
-                self._log("Автостарт после калибровки отменён.", COLORS["yellow"])
             if self.sequence_steps:
                 self._stop_sequence_progress()
             self._log("→ STOP", COLORS["red"])
@@ -4880,15 +4895,10 @@ class MainWindow(QMainWindow):
         finally:
             # Гарантированный сброс состояния — даже если что-то выше упало.
             self._running = False
-            self._paused_by_gaze = False
-            self._resuming_after_gaze_pause = False
             self._calibration_in_progress = False
             self._calibration_phase_collecting = False
             self._calibration_after = None
-            self._waiting_gaze_center = False
-            self._start_now_once = False
             self._sequence_index = 0
-            self._pause_started_at = None
             self._sequence_stage_deadline = None
             self.start_btn.setEnabled(self.serial.is_open)
             self.stop_btn.setEnabled(False)
@@ -4916,8 +4926,7 @@ class MainWindow(QMainWindow):
             self._auto_apply_timer.start(200)
             QTimer.singleShot(400, self._apply_calibration_to_firmware)
         else:
-            if self._running or self._recording_active or self._waiting_gaze_center:
-                self._waiting_gaze_center = False
+            if self._running or self._recording_active:
                 self._stop(reason="Serial отключен")
             self._sequence_timer.stop()
             self._set_serial_checkbox(False)
