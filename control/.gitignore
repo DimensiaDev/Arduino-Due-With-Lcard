@@ -1,7 +1,0 @@
-main.spec
-dist/
-build/
-.ruff_cache
-*.build/
-*.dist/
-*.onefile-build/

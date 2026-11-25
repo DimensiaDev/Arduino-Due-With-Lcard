@@ -1,14 +1,16 @@
 name: Build Windows exe
 
 # Один файл .exe со всеми библиотеками (PyInstaller, --onefile).
-# Запускается автоматически при изменении исходника в control/main1.py
-# и вручную: Actions -> Build Windows exe -> Run workflow.
+# Всё приложение живёт в пакете dualsine/, точка входа — dualsine/__main__.py
+# (локальный запуск: python -m dualsine из корня репозитория).
+# Запускается автоматически при изменении исходников и вручную:
+# Actions -> Build Windows exe -> Run workflow.
 
 on:
   push:
     branches: [FIX_CALIBRATION]
     paths:
-      - "control/main1.py"
+      - "dualsine/**"
       - ".github/workflows/build-windows.yml"
   workflow_dispatch:
 
@@ -22,9 +24,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      # control/requirements.txt записан в UTF-16, поэтому ставим состав
-      # приложения списком (те же версии, что и в requirements.txt,
-      # без matplotlib — он приложению не нужен и сильно раздувает .exe).
+      # Состав приложения ставим списком (те же версии, что и в
+      # requirements.txt, без matplotlib — он приложению не нужен
+      # и сильно раздувает .exe).
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -38,23 +40,24 @@ jobs:
 
       - name: Import smoke test
         run: |
-          cd control
-          python -c "import main1; print('import ok')"
+          python -c "import dualsine.app, dualsine.main_window; print('import ok')"
 
+      # --paths . добавляет корень репозитория в путь поиска,
+      # чтобы пакет dualsine разрешался при анализе входной точки.
       - name: Build one-file exe
-        working-directory: control
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name DualSineController `
-            --icon ../icon.ico `
+            --icon icon.ico `
+            --paths . `
             --collect-all pylsl `
             --hidden-import=pylsl `
             --hidden-import=serial.tools.list_ports `
-            main1.py
+            dualsine/__main__.py
           Get-Item dist\DualSineController.exe | Format-List Name,Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: DualSineController-windows
-          path: control/dist/DualSineController.exe
+          path: dist/DualSineController.exe
           if-no-files-found: error
