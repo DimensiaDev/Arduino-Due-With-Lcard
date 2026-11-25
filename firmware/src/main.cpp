@@ -13,6 +13,16 @@ static const int CMD_BUF_SIZE = 64;
 static const float ABS_GAIN_MAX = 20.0f;
 static const uint8_t NUM_DACS = 2;
 
+// TCRT5000 x2 (аналоговые входы, см. tcrt5000_test.ino в корне репозитория)
+static const uint8_t NUM_IR_SENSORS = 2;
+// sensor 0 = ПРАВО (A2), sensor 1 = ЛЕВО (A3) — соответствует «лицом к лицу» в UI.
+// A2/A3 не пересекаются с DAC0/DAC1 (PB15/PB16).
+static const uint8_t IR_PIN[NUM_IR_SENSORS] = {A2, A3};
+static const uint16_t IR_ADC_MAX = 4095;
+static const float IR_VREF = 3.3f;
+static const uint16_t IR_TH_DEFAULT = 1500;  // raw < порога => есть отражение
+static const uint16_t IR_HY_DEFAULT = 200;   // гистерезис, чтобы состояние не дребезжало
+
 volatile float g_amp1 = 0.5f;
 volatile float g_phase1 = 0.0f;
 volatile float g_amp2 = 0.5f;
@@ -41,6 +51,20 @@ volatile uint32_t g_dbgClipHigh[NUM_DACS] = {0, 0};
 volatile uint32_t g_dbgClipLow[NUM_DACS] = {0, 0};
 volatile uint32_t g_dbgSamples = 0;
 volatile uint32_t g_isrUs = 0;
+
+volatile bool g_irEnabled = false;
+volatile uint16_t g_irRaw[NUM_IR_SENSORS] = {0, 0};
+volatile uint16_t g_irMin[NUM_IR_SENSORS] = {IR_ADC_MAX, IR_ADC_MAX};
+volatile uint16_t g_irMax[NUM_IR_SENSORS] = {0, 0};
+volatile bool g_irReflect[NUM_IR_SENSORS] = {false, false};
+volatile uint16_t g_irTh[NUM_IR_SENSORS] = {IR_TH_DEFAULT, IR_TH_DEFAULT};
+volatile uint16_t g_irHyst[NUM_IR_SENSORS] = {IR_HY_DEFAULT, IR_HY_DEFAULT};
+
+// Накопители окна 100 мс: raw = среднее по ВСЕМУ окну, а не по нескольким
+// отсчётам подряд. Иначе одна «мгновенная» точка раз в 100 мс ловит шум и
+// пульсации 100 Гц (алиасинг) — из-за этого калибровка взгляда «плыла».
+uint32_t g_irAcc[NUM_IR_SENSORS] = {0, 0};
+uint32_t g_irAccCount[NUM_IR_SENSORS] = {0, 0};
 
 float clampAmplitude(float a) { return constrain(a, 0.0f, MAX_AMPLITUDE); }
 float clampDC(float dc) { return constrain(dc, 0.0f, MAX_DC); }
@@ -240,6 +264,87 @@ void printDebug() {
     Serial.println("}");
 }
 
+static uint32_t g_lastIrMs = 0;
+
+void pollIR() {
+    if (!g_irEnabled) {
+        // Телеметрия ИК выключена — не жжём CPU на опрос АЦП. Постоянный
+        // опрос в основном цикле задерживает ISR генерации (TC6) и портит
+        // тайминги отсчётов DAC. Накопленные значения сбрасываем, чтобы при
+        // повторном включении окно считалось заново.
+        for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+            g_irAcc[s] = 0;
+            g_irAccCount[s] = 0;
+            g_irMin[s] = IR_ADC_MAX;
+            g_irMax[s] = 0;
+        }
+        return;
+    }
+    for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+        // После смены канала АЦП первый отсчёт может быть «грязным»
+        // (заряд УВХ от предыдущего канала) — отбрасываем его.
+        analogRead(IR_PIN[s]);
+        uint16_t v = (uint16_t)analogRead(IR_PIN[s]);
+
+        // Копим всё окно до следующей отправки (100 мс): тысячи отсчётов
+        // вместо восьми подряд — шум и фоновая 100-герцовая пульсация
+        // усредняются полностью.
+        g_irAcc[s] += v;
+        g_irAccCount[s]++;
+        if (v < g_irMin[s]) g_irMin[s] = v;
+        if (v > g_irMax[s]) g_irMax[s] = v;
+    }
+}
+
+void emitIR(uint8_t s) {
+    uint32_t count = g_irAccCount[s];
+    uint16_t raw = count ? (uint16_t)(g_irAcc[s] / count) : g_irRaw[s];
+    g_irAcc[s] = 0;
+    g_irAccCount[s] = 0;
+    g_irRaw[s] = raw;
+
+    // Гистерезис состояния — по среднему за окно.
+    if (!g_irReflect[s] && raw < g_irTh[s]) {
+        g_irReflect[s] = true;
+    } else if (g_irReflect[s] && raw > (uint16_t)(g_irTh[s] + g_irHyst[s])) {
+        g_irReflect[s] = false;
+    }
+
+    uint16_t mn = g_irMin[s];
+    uint16_t mx = g_irMax[s];
+    g_irMin[s] = IR_ADC_MAX;
+    g_irMax[s] = 0;
+
+    float volts = raw * IR_VREF / (float)IR_ADC_MAX;
+
+    Serial.print("{\"ir\":1");
+    Serial.print(",\"sensor\":"); Serial.print(s);
+    Serial.print(",\"raw\":"); Serial.print(raw);
+    Serial.print(",\"v\":"); Serial.print(volts, 3);
+    Serial.print(",\"min\":"); Serial.print(mn);
+    Serial.print(",\"max\":"); Serial.print(mx);
+    Serial.print(",\"ref\":"); Serial.print(g_irReflect[s] ? 1 : 0);
+    Serial.print(",\"th\":"); Serial.print(g_irTh[s]);
+    Serial.println("}");
+}
+
+void printIR() {
+    if (!g_irEnabled) {
+        // Телеметрия выключена — окно не копим, иначе счётчик переполнится.
+        for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+            g_irAcc[s] = 0;
+            g_irAccCount[s] = 0;
+        }
+        return;
+    }
+    uint32_t now = millis();
+    if (now - g_lastIrMs < 100) return;
+    g_lastIrMs = now;
+    for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+        emitIR(s);
+    }
+}
+
 char g_cmdBuf[CMD_BUF_SIZE];
 int g_cmdIdx = 0;
 
@@ -253,6 +358,21 @@ void setChannelFrequency(uint8_t channel, uint8_t slot, float value) {
     }
     recomputeIncrements(channel);
     g_running = wasRunning;
+}
+
+// Разбор суффикса ключа IRTH/IRHY: "" — оба датчика, "0"/"1" — конкретный.
+static bool parseIrSensors(const char *suffix, uint8_t *sel, uint8_t &n) {
+    if (suffix[0] == '\0') {
+        for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) sel[s] = s;
+        n = NUM_IR_SENSORS;
+        return true;
+    }
+    if (suffix[0] >= '0' && suffix[0] < '0' + NUM_IR_SENSORS && suffix[1] == '\0') {
+        sel[0] = (uint8_t)(suffix[0] - '0');
+        n = 1;
+        return true;
+    }
+    return false;
 }
 
 void processCommand(const char *cmd) {
@@ -307,6 +427,25 @@ void processCommand(const char *cmd) {
         return;
     }
 
+    if (strncmp(cmd, "IR?", 3) == 0) {
+        for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) emitIR(s);
+        return;
+    }
+
+    if (strncmp(cmd, "IR ", 3) == 0) {
+        const char *arg = cmd + 3;
+        if (strncmp(arg, "ON", 2) == 0) {
+            g_irEnabled = true;
+            Serial.println("OK IR ON");
+        } else if (strncmp(arg, "OFF", 3) == 0) {
+            g_irEnabled = false;
+            Serial.println("OK IR OFF");
+        } else {
+            Serial.println("ERR IR ON|OFF");
+        }
+        return;
+    }
+
     if (sscanf(cmd, "SET %7s %f", key, &val) == 2) {
         if (strcmp(key, "A1") == 0) {
             g_amp1 = clampAmplitude(val);
@@ -336,6 +475,30 @@ void processCommand(const char *cmd) {
             if (val > ABS_GAIN_MAX) val = ABS_GAIN_MAX;
             g_gainMax = val;
             Serial.print("OK GM="); Serial.println(g_gainMax, 4);
+        } else if (strncmp(key, "IRTH", 4) == 0) {
+            uint8_t sel[NUM_IR_SENSORS];
+            uint8_t n;
+            if (parseIrSensors(key + 4, sel, n)) {
+                uint16_t v = (uint16_t)constrain(val, 0.0f, (float)IR_ADC_MAX);
+                for (uint8_t i = 0; i < n; ++i) g_irTh[sel[i]] = v;
+                Serial.print("OK IRTH");
+                if (n == 1) Serial.print((char)('0' + sel[0]));
+                Serial.print("="); Serial.println(v);
+            } else {
+                Serial.print("ERR unknown key: "); Serial.println(key);
+            }
+        } else if (strncmp(key, "IRHY", 4) == 0) {
+            uint8_t sel[NUM_IR_SENSORS];
+            uint8_t n;
+            if (parseIrSensors(key + 4, sel, n)) {
+                uint16_t v = (uint16_t)constrain(val, 0.0f, 1000.0f);
+                for (uint8_t i = 0; i < n; ++i) g_irHyst[sel[i]] = v;
+                Serial.print("OK IRHY");
+                if (n == 1) Serial.print((char)('0' + sel[0]));
+                Serial.print("="); Serial.println(v);
+            } else {
+                Serial.print("ERR unknown key: "); Serial.println(key);
+            }
         } else if (strcmp(key, "SR") == 0) {
             bool wasRunning = g_running;
             g_running = false;
@@ -374,10 +537,15 @@ void setup() {
     recomputeAllIncrements();
     setupTimer(g_sampleRate);
 
+    analogReadResolution(12);
+    for (uint8_t s = 0; s < NUM_IR_SENSORS; ++s) {
+        pinMode(IR_PIN[s], INPUT);
+    }
+
     NVIC_SetPriority(UART_IRQn, 0);
     NVIC_SetPriority(TC6_IRQn, 1);
 
-    Serial.println("READY dual_dac_sine v4.0");
+    Serial.println("READY dual_dac_sine v4.3 (ir tcrt5000 x2: A2/A3, 100ms window)");
 }
 
 void loop() {
@@ -395,4 +563,6 @@ void loop() {
     }
 
     printDebug();
+    pollIR();
+    printIR();
 }

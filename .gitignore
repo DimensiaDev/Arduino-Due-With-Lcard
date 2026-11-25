@@ -3,3 +3,7 @@
 .pio
 build/
 dist/
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
